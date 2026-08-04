@@ -1,0 +1,14 @@
+department_id,department_code,department_name,location,budget,headcount
+1,ENG,Engineering,Hyderabad,50000000,299
+2,AI,Artificial Intelligence,Bengaluru,65000000,150
+3,QA,Quality Assurance,Hyderabad,22000000,100
+4,HR,Human Resources,Hyderabad,15000000,40
+5,FIN,Finance,Mumbai,28000000,50
+6,SALES,Sales,Mumbai,40000000,119
+7,MKT,Marketing,Mumbai,18000000,40
+8,OPS,Operations,Pune,25000000,50
+9,LEGAL,Legal,Mumbai,12000000,10
+10,IT,IT Support,Chennai,20000000,40
+11,DS,Data Science,Bengaluru,32000000,60
+12,CS,Customer Success,Pune,17000000,40
+13,EXEC,Executive Office,Hyderabad,100000000,2

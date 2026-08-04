@@ -1,0 +1,106 @@
+[
+    {
+        "department_id": 1,
+        "department_code": "ENG",
+        "department_name": "Engineering",
+        "location": "Hyderabad",
+        "budget": 50000000,
+        "headcount": 299
+    },
+    {
+        "department_id": 2,
+        "department_code": "AI",
+        "department_name": "Artificial Intelligence",
+        "location": "Bengaluru",
+        "budget": 65000000,
+        "headcount": 150
+    },
+    {
+        "department_id": 3,
+        "department_code": "QA",
+        "department_name": "Quality Assurance",
+        "location": "Hyderabad",
+        "budget": 22000000,
+        "headcount": 100
+    },
+    {
+        "department_id": 4,
+        "department_code": "HR",
+        "department_name": "Human Resources",
+        "location": "Hyderabad",
+        "budget": 15000000,
+        "headcount": 40
+    },
+    {
+        "department_id": 5,
+        "department_code": "FIN",
+        "department_name": "Finance",
+        "location": "Mumbai",
+        "budget": 28000000,
+        "headcount": 50
+    },
+    {
+        "department_id": 6,
+        "department_code": "SALES",
+        "department_name": "Sales",
+        "location": "Mumbai",
+        "budget": 40000000,
+        "headcount": 119
+    },
+    {
+        "department_id": 7,
+        "department_code": "MKT",
+        "department_name": "Marketing",
+        "location": "Mumbai",
+        "budget": 18000000,
+        "headcount": 40
+    },
+    {
+        "department_id": 8,
+        "department_code": "OPS",
+        "department_name": "Operations",
+        "location": "Pune",
+        "budget": 25000000,
+        "headcount": 50
+    },
+    {
+        "department_id": 9,
+        "department_code": "LEGAL",
+        "department_name": "Legal",
+        "location": "Mumbai",
+        "budget": 12000000,
+        "headcount": 10
+    },
+    {
+        "department_id": 10,
+        "department_code": "IT",
+        "department_name": "IT Support",
+        "location": "Chennai",
+        "budget": 20000000,
+        "headcount": 40
+    },
+    {
+        "department_id": 11,
+        "department_code": "DS",
+        "department_name": "Data Science",
+        "location": "Bengaluru",
+        "budget": 32000000,
+        "headcount": 60
+    },
+    {
+        "department_id": 12,
+        "department_code": "CS",
+        "department_name": "Customer Success",
+        "location": "Pune",
+        "budget": 17000000,
+        "headcount": 40
+    },
+    {
+        "department_id": 13,
+        "department_code": "EXEC",
+        "department_name": "Executive Office",
+        "location": "Hyderabad",
+        "budget": 100000000,
+        "headcount": 2
+    }
+]

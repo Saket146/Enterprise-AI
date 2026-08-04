@@ -1,0 +1,16 @@
+role_id,role_name,level
+1,CEO,Executive
+2,CTO,Executive
+3,CFO,Executive
+4,HR Director,Director
+5,Engineering Manager,Manager
+6,Project Manager,Manager
+7,Backend Engineer,Senior
+8,Frontend Engineer,Senior
+9,AI Engineer,Senior
+10,QA Engineer,Mid
+11,Data Scientist,Senior
+12,Finance Analyst,Mid
+13,Sales Executive,Mid
+14,HR Executive,Mid
+15,Intern,Entry
