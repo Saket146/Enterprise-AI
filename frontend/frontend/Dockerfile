@@ -1,18 +1,20 @@
-FROM node:18-alpine
+FROM node:18-alpine AS build
 
 WORKDIR /app
 
 # Copy dependency structures
 COPY package.json package-lock.json* ./
 
-# Install npm dependencies
-RUN npm install
+# Reproducible production dependency install
+RUN npm ci
 
 # Copy frontend source files
 COPY . .
 
-# Expose Vite dev port
-EXPOSE 5173
+RUN npm run build
 
-# Run development server in host mode
-CMD ["npm", "run", "dev", "--", "--host"]
+FROM nginx:1.27-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

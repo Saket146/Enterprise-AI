@@ -451,7 +451,7 @@ export const AIAssistant: React.FC = () => {
                               color: 'white',
                               display: 'flex',
                               alignItems: 'center',
-                              justify-content: 'center',
+                              justifyContent: 'center',
                               fontSize: '0.75rem',
                               fontWeight: 'bold'
                             }}>
@@ -529,7 +529,7 @@ export const AIAssistant: React.FC = () => {
           backdropFilter: 'blur(4px)',
           display: 'flex',
           alignItems: 'center',
-          justify-content: 'center',
+          justifyContent: 'center',
           zIndex: 999
         }}>
           <div className="glass-card" style={{ width: '500px', maxWidth: '90%', padding: '28px' }}>

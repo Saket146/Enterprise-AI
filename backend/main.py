@@ -10,6 +10,8 @@ from app.configuration.config import settings
 from app.database.connection import SessionLocal, engine
 from app.models.models import Role, Employee
 from app.authentication.security import get_password_hash
+from app.observability import metrics
+from app.database.connection import Base
 
 # Configure logging
 logging.basicConfig(
@@ -28,8 +30,8 @@ app = FastAPI(
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
-    allow_credentials=True,
+    allow_origins=settings.CORS_ORIGINS.split(","),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -50,6 +52,9 @@ async def add_process_time_header(request: Request, call_next):
     response = await call_next(request)
     process_time = time.time() - start_time
     response.headers["X-Process-Time"] = str(process_time)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    metrics.record(request.url.path, process_time * 1000, response.status_code)
     return response
 
 # Database auto-patch and default seeds on startup
@@ -58,6 +63,7 @@ def startup_db_setup():
     logger.info("Verifying database schema and patching missing fields...")
     db: Session = SessionLocal()
     try:
+        Base.metadata.create_all(bind=engine)
         # 1. Alter Employee table to add hashed_password if missing
         db.execute(text("ALTER TABLE employees ADD COLUMN IF NOT EXISTS hashed_password VARCHAR(255);"))
         db.commit()
@@ -130,6 +136,10 @@ from app.api.projects import router as project_router
 from app.api.knowledge import router as knowledge_router
 from app.api.communications import router as comms_router
 from app.api.ingestion import router as ingestion_router
+from app.api.workflows import router as workflows_router
+from app.api.analytics import router as analytics_router
+from app.api.monitoring import router as monitoring_router
+from app.api.evaluations import router as evaluations_router
 
 app.include_router(auth_router)
 app.include_router(employee_router)
@@ -137,6 +147,14 @@ app.include_router(project_router)
 app.include_router(knowledge_router)
 app.include_router(comms_router)
 app.include_router(ingestion_router)
+app.include_router(workflows_router)
+app.include_router(analytics_router)
+app.include_router(monitoring_router)
+app.include_router(evaluations_router)
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "version": settings.PROJECT_VERSION}
 
 @app.get("/")
 def read_root():

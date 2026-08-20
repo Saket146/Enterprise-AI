@@ -9,9 +9,9 @@ services:
     container_name: enterprise_postgres
     restart: always
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: enterprise_ai_os
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-enterprise_ai_os}
     ports:
       - "5432:5432"
     volumes:
@@ -96,11 +96,15 @@ services:
     environment:
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-enterprise_ai_os}
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - NEO4J_URI=bolt://neo4j:7687
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      - ENTERPRISE_API_KEY=${ENTERPRISE_API_KEY:-}
+      - DEBUG=false
     depends_on:
       postgres:
         condition: service_healthy
@@ -120,7 +124,7 @@ services:
     container_name: enterprise_frontend
     restart: always
     ports:
-      - "5173:5173"
+      - "5173:80"
     depends_on:
       - backend
 

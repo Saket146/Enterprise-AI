@@ -450,3 +450,26 @@ class AuditLog(Base):
 
     # Relationships
     employee = relationship("Employee", back_populates="audit_logs")
+
+
+class Approval(Base):
+    __tablename__ = "approvals"
+    approval_id = Column(Integer, primary_key=True)
+    workflow_id = Column(Integer, ForeignKey("workflow_runs.workflow_id"), nullable=False)
+    requested_by = Column(Integer, ForeignKey("employees.employee_id"))
+    approver_role = Column(String(100), nullable=False)
+    status = Column(String(30), nullable=False, default="pending")
+    decision_note = Column(Text)
+    decided_at = Column(DateTime)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class EvaluationRun(Base):
+    __tablename__ = "evaluation_runs"
+    evaluation_id = Column(Integer, primary_key=True)
+    suite_name = Column(String(100), nullable=False)
+    metric_name = Column(String(100), nullable=False)
+    score = Column(DECIMAL(6, 3), nullable=False)
+    sample_count = Column(Integer, nullable=False)
+    details = Column(Text)
+    created_at = Column(DateTime, server_default=func.now())

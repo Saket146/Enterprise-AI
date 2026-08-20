@@ -4,8 +4,8 @@ from pydantic import Field
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Enterprise AI Operating System"
-    PROJECT_VERSION: str = "0.1.0"
-    DEBUG: bool = True
+    PROJECT_VERSION: str = "3.0.0"
+    DEBUG: bool = False
 
     # PostgreSQL Database Settings
     POSTGRES_USER: str = "postgres"
@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "enterprise_ai_os_secret_key_very_secure_change_me_in_prod"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours
+    CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+    API_KEY_HEADER: str = "X-Enterprise-API-Key"
+    ENTERPRISE_API_KEY: str = ""
+    MAX_REQUEST_BYTES: int = 1_048_576
+    SENSITIVE_DATA_MASKING: bool = True
 
     class Config:
         env_file = os.path.join(

@@ -7,13 +7,14 @@ import { Projects } from './pages/Projects';
 import { Knowledge } from './pages/Knowledge';
 import { Communications } from './pages/Communications';
 import { AIAssistant } from './pages/AIAssistant';
+import { OperationsCenter } from './pages/OperationsCenter';
 
 import {
-  LayoutDashboard, Users, Briefcase, FileText, Mail, BrainCircuit, LogOut, Terminal
+  LayoutDashboard, Users, Briefcase, FileText, Mail, BrainCircuit, LogOut, Terminal, ShieldCheck
 } from 'lucide-react';
 import './styles/index.css';
 
-type PageView = 'dashboard' | 'employees' | 'projects' | 'knowledge' | 'communications' | 'ai-assistant';
+type PageView = 'dashboard' | 'employees' | 'projects' | 'knowledge' | 'communications' | 'ai-assistant' | 'operations';
 
 export const App: React.FC = () => {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
@@ -65,6 +66,8 @@ export const App: React.FC = () => {
         return <Communications />;
       case 'ai-assistant':
         return <AIAssistant />;
+      case 'operations':
+        return <OperationsCenter />;
       default:
         return <Dashboard />;
     }
@@ -78,6 +81,7 @@ export const App: React.FC = () => {
       case 'knowledge': return 'Central Knowledge Catalog';
       case 'communications': return 'Communications Hub';
       case 'ai-assistant': return 'Multi-Agent AI Playground';
+      case 'operations': return 'Enterprise Operations Center';
       default: return 'Enterprise AI OS';
     }
   };
@@ -132,6 +136,9 @@ export const App: React.FC = () => {
             className={`sidebar-menu-item ${activePage === 'ai-assistant' ? 'active' : ''}`}
           >
             <BrainCircuit size={18} /> AI Assistants
+          </li>
+          <li onClick={() => setActivePage('operations')} className={`sidebar-menu-item ${activePage === 'operations' ? 'active' : ''}`}>
+            <ShieldCheck size={18} /> Operations Center
           </li>
         </ul>
 

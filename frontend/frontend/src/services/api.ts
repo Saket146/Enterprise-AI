@@ -178,5 +178,12 @@ export const api = {
   ingestion: {
     syncQdrant: () => request('/api/ingestion/qdrant', { method: 'POST' }),
     syncNeo4j: () => request('/api/ingestion/neo4j', { method: 'POST' }),
-  }
+  },
+  workflows: {
+    run: (data: { workflow_type: string; title: string; payload: string; requires_approval: boolean }) => request('/api/workflows/run', { method: 'POST', body: JSON.stringify(data) }),
+    runs: () => request('/api/workflows/runs'),
+  },
+  analytics: { overview: () => request('/api/analytics/overview') },
+  monitoring: { dashboard: () => request('/api/monitoring/dashboard') },
+  evaluations: { run: () => request('/api/evaluations/run', { method: 'POST' }) }
 };
