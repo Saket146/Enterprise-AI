@@ -20,3 +20,7 @@ def overview(user=Depends(RoleChecker(["Project Manager", "HR Manager", "AI Admi
             "employees": {"workload": [{"name": f"{f} {l}", "value": n} for f,l,n in workload]},
             "clients": {"contracts": [{"name": s or "Unknown", "value": n} for s,n in contracts], "engagement": db.query(func.count(Client.client_id)).filter(Client.status == "Active").scalar() or 0},
             "ai": {"queries": total_runs, "agent_usage": db.query(func.count(AgentLog.agent_log_id)).scalar() or 0, "success_rate": round(successful / total_runs * 100, 1)}}
+
+
+
+#####
