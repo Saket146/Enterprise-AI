@@ -26,16 +26,23 @@ class LLMService:
 
         logger.info(f"LLM Service initialized. Selected Provider: {self.provider.upper()}")
 
-    def generate(self, prompt: str, system_instruction: Optional[str] = None, max_tokens: int = 1500) -> str:
+    @property
+    def has_model(self) -> bool:
+        """True when a real language model (Gemini or OpenAI) is configured."""
+        return (self.provider == "gemini" and bool(self.gemini_key)) or (self.provider == "openai" and bool(self.openai_key))
+
+    def generate(self, prompt: str, system_instruction: Optional[str] = None, max_tokens: int = 1500, strict: bool = False) -> Optional[str]:
         """
         Synthesize completions using active LLM APIs or smart context-driven heuristics.
+        With strict=True the method returns None instead of a mock reply when no model
+        is configured or the model call fails, so the caller can use its own fallback.
         """
         if self.provider == "gemini" and self.gemini_key:
-            return self._call_gemini(prompt, system_instruction, max_tokens)
+            return self._call_gemini(prompt, system_instruction, max_tokens, strict)
         elif self.provider == "openai" and self.openai_key:
-            return self._call_openai(prompt, system_instruction, max_tokens)
+            return self._call_openai(prompt, system_instruction, max_tokens, strict)
         else:
-            return self._call_mock(prompt, system_instruction)
+            return None if strict else self._call_mock(prompt, system_instruction)
 
     def parse_routing(self, prompt: str, history: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -44,27 +51,29 @@ class LLMService:
         last_message = prompt.lower()
         
         # Heuristics routing matching phase 2 specifications
-        if any(w in last_message for w in ["policy", "handbook", "leave", "vacation", "benefit", "sick"]):
+        aggregate_words = [
+            "how many", "number of", "total number", "count(*)", "count of", "average", "avg ", "sum(",
+            "sum of", "highest", "lowest", "per department", "by department", "by status", "by role",
+            "by industry", "by priority", "breakdown", "headcount", "select ",
+        ]
+        if any(w in last_message for w in aggregate_words):
+            next_agent = "analytics"
+            reason = "Query requests a structured aggregate from the relational database."
+        elif any(w in last_message for w in ["policy", "policies", "handbook", "leave", "vacation", "benefit", "sick", "guideline"]):
             next_agent = "hr"
             reason = "Query contains HR policy, benefits or leave keywords."
-        elif any(w in last_message for w in ["employee", "manager", "hire", "salary", "reports", "staff", "who is"]):
-            next_agent = "hr"
-            reason = "Query targets employee directory profiles, reporting line or staffing details."
+        elif any(w in last_message for w in ["project", "task", "milestone", "ticket", "jira", "sprint", "prj-"]):
+            next_agent = "engineering"
+            reason = "Query asks about project status, tasks or milestones."
         elif any(w in last_message for w in ["budget", "allocated", "approved", "spend", "fiscal", "expense", "invoice"]):
             next_agent = "finance"
             reason = "Query requests financial allocations or budget balances."
-        elif any(w in last_message for w in ["client", "customer", "industry", "country", "sales", "revenue"]):
+        elif any(w in last_message for w in ["client", "customer", "industry", "sales", "revenue", "contract", "agreement"]):
             next_agent = "sales"
             reason = "Query searches for clients or contract value variables."
-        elif any(w in last_message for w in ["contract", "agreement"]):
-            next_agent = "sales"
-            reason = "Query references client agreements or legal contract specifications."
-        elif any(w in last_message for w in ["project", "task", "milestone", "ticket", "jira", "sprint"]):
-            next_agent = "engineering"
-            reason = "Query asks about project status, tasks or milestones."
-        elif any(w in last_message for w in ["select", "table", "row_count", "groupby", "count(*)", "sum("]):
-            next_agent = "analytics"
-            reason = "Query contains SQL queries or structured analytical request keywords."
+        elif any(w in last_message for w in ["employee", "manager", "hire", "salary", "reports to", "staff", "who is", "who am i", "my profile", "phone", "email of"]):
+            next_agent = "hr"
+            reason = "Query targets employee directory profiles, reporting line or staffing details."
         elif any(w in last_message for w in ["document", "file", "pdf", "docx", "manual", "txt"]):
             next_agent = "document"
             reason = "Query explicitly references file catalog contents or upload parameters."
@@ -77,7 +86,7 @@ class LLMService:
             "reasoning": reason
         }
 
-    def _call_gemini(self, prompt: str, system_instruction: Optional[str], max_tokens: int) -> str:
+    def _call_gemini(self, prompt: str, system_instruction: Optional[str], max_tokens: int, strict: bool = False) -> Optional[str]:
         """Invoke Gemini Beta REST API."""
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.gemini_key}"
@@ -105,12 +114,12 @@ class LLMService:
                 return text.strip()
             else:
                 logger.error(f"Gemini API returned status {res.status_code}: {res.text}")
-                return self._call_mock(prompt, system_instruction)
+                return None if strict else self._call_mock(prompt, system_instruction)
         except Exception as e:
             logger.error(f"Gemini API call failed: {e}")
-            return self._call_mock(prompt, system_instruction)
+            return None if strict else self._call_mock(prompt, system_instruction)
 
-    def _call_openai(self, prompt: str, system_instruction: Optional[str], max_tokens: int) -> str:
+    def _call_openai(self, prompt: str, system_instruction: Optional[str], max_tokens: int, strict: bool = False) -> Optional[str]:
         """Invoke OpenAI REST API."""
         try:
             url = "https://api.openai.com/v1/chat/completions"
@@ -138,10 +147,10 @@ class LLMService:
                 return text.strip()
             else:
                 logger.error(f"OpenAI API returned status {res.status_code}: {res.text}")
-                return self._call_mock(prompt, system_instruction)
+                return None if strict else self._call_mock(prompt, system_instruction)
         except Exception as e:
             logger.error(f"OpenAI API call failed: {e}")
-            return self._call_mock(prompt, system_instruction)
+            return None if strict else self._call_mock(prompt, system_instruction)
 
     def _call_mock(self, prompt: str, system_instruction: Optional[str]) -> str:
         """
@@ -152,16 +161,29 @@ class LLMService:
         
         # 1. Check if we are parsing planner/routing instruct
         if "next_agent" in prompt_lower or "routing" in prompt_lower:
-            route_res = self.parse_routing(prompt, [])
+            request_match = re.search(r'User Request:\s*"(.*?)"\s*$', prompt, re.DOTALL)
+            route_res = self.parse_routing(request_match.group(1) if request_match else prompt, [])
             return json.dumps(route_res)
+
+        # 1b. Critic agent: the deterministic composer only states retrieved facts, so approve
+        if "critic agent" in prompt_lower:
+            return "APPROVED"
 
         # 2. Check if we are verifying report content (Verification agent)
         if "hallucination" in prompt_lower or "scrub" in prompt_lower:
             return "Safety evaluation passed. Factual accuracy confirmed against secure databases."
 
-        # 3. Handle data rendering in the report generator
+        # 3. SQL generation: without a real model the Analytics Agent uses the
+        # deterministic question templates in app.services.sql_retriever, so the
+        # mock returns no SQL here.
+        if "sql analytics agent" in prompt_lower:
+            return ""
+
+        # 4. Handle data rendering in the report generator
         # Extract the retrieved context block from prompt
-        context_matches = re.findall(r"source:.*?\n.*?(?:\n|$)", prompt, re.IGNORECASE)
+        # Only look below the "Retrieved Contexts:" marker so chat history is not mistaken for context
+        context_section = prompt.split("Retrieved Contexts:", 1)[-1]
+        context_matches = re.findall(r"source:.*?\n.*?(?:\n|$)", context_section, re.IGNORECASE)
         
         if context_matches:
             # We have retrieved context! Let's format a beautiful markdown report.

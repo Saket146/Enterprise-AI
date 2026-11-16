@@ -1,9 +1,9 @@
 import os
 import re
+import uuid
 import logging
 from typing import List, Dict, Any
 from sqlalchemy.orm import Session
-from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from neo4j import GraphDatabase
@@ -40,6 +40,8 @@ class IngestionPipelineService:
     def model(self):
         """Lazy load SentenceTransformer model to save memory during initialization."""
         if self._model is None:
+            from sentence_transformers import SentenceTransformer
+
             logger.info("Loading SentenceTransformer model 'all-MiniLM-L6-v2'...")
             self._model = SentenceTransformer("all-MiniLM-L6-v2")
         return self._model
@@ -69,173 +71,158 @@ class IngestionPipelineService:
             except Exception as e:
                 logger.error(f"Failed to initialize collection {col}: {e}")
 
+    def _index_records(self, client: QdrantClient, collection: str, records: List[Dict[str, Any]], batch_size: int = 64) -> int:
+        """
+        Chunk, embed and upsert records into a Qdrant collection in batches.
+        Each record is {"key": unique string, "content": text, "payload": metadata dict}.
+        Point ids are derived from the key, so re-running the sync updates points instead of duplicating them.
+        """
+        pending_ids, pending_texts, pending_payloads = [], [], []
+        indexed = 0
+
+        def flush():
+            nonlocal indexed
+            if not pending_texts:
+                return
+            vectors = self.model.encode(pending_texts, batch_size=batch_size, show_progress_bar=False)
+            client.upsert(
+                collection_name=collection,
+                points=[
+                    qmodels.PointStruct(id=pid, vector=vec.tolist(), payload=payload)
+                    for pid, vec, payload in zip(pending_ids, vectors, pending_payloads)
+                ]
+            )
+            indexed += len(pending_texts)
+            pending_ids.clear(); pending_texts.clear(); pending_payloads.clear()
+
+        for rec in records:
+            for idx, chunk in enumerate(chunk_text(rec["content"])):
+                pending_ids.append(str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{rec['key']}-{idx}")))
+                pending_texts.append(chunk)
+                pending_payloads.append({"text": chunk, **rec["payload"]})
+                if len(pending_texts) >= batch_size:
+                    flush()
+        flush()
+        return indexed
+
     def sync_to_qdrant(self, db: Session) -> Dict[str, Any]:
         """Index postgres text fields into Qdrant collections."""
         client = get_qdrant_client()
         self.initialize_qdrant_collections(client)
-        
-        stats = {"documents": 0, "policies": 0, "emails": 0, "meetings": 0, "chats": 0}
-        
-        # 1. Sync Documents
-        docs = db.query(Document).all()
-        doc_points = []
-        for d in docs:
-            # Check if there is actual content in RAG files
-            content = f"Document Title: {d.title}. Type: {d.document_type}. File: {d.file_name}."
-            # Attempt to read content if file exists
-            try:
-                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                # Check different folders
-                paths_to_try = [
-                    os.path.join(base_dir, "synthetic_data", "rag_docs", "handbook", d.file_name or ""),
-                    os.path.join(base_dir, "synthetic_data", "rag_docs", "policies", d.file_name or ""),
-                    os.path.join(base_dir, "synthetic_data", "rag_docs", "engineering", d.file_name or ""),
-                    os.path.join(base_dir, "synthetic_data", "rag_docs", "finance", d.file_name or ""),
-                    os.path.join(base_dir, "synthetic_data", "rag_docs", "contracts", d.file_name or ""),
-                    os.path.join(base_dir, "synthetic_data", "rag_docs", "manuals", d.file_name or "")
-                ]
-                for p in paths_to_try:
-                    if d.file_name and os.path.exists(p):
-                        with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                            content += "\n" + f.read()
-                        break
-            except Exception as fe:
-                logger.warning(f"Could not read content for file {d.file_name}: {fe}")
 
-            chunks = chunk_text(content)
-            for idx, chunk in enumerate(chunks):
-                vector = self.model.encode(chunk).tolist()
-                pt_id = f"doc-{d.document_id}-{idx}"
-                client.upsert(
-                    collection_name="documents",
-                    points=[
-                        qmodels.PointStruct(
-                            id=pt_id,
-                            vector=vector,
-                            payload={
-                                "text": chunk,
-                                "document_id": d.document_id,
-                                "project_id": d.project_id,
-                                "department_id": d.department_id,
-                                "title": d.title,
-                                "type": d.document_type,
-                                "timestamp": d.created_at.isoformat() if d.created_at else None
-                            }
-                        )
-                    ]
-                )
-                stats["documents"] += 1
+        stats = {"documents": 0, "policies": 0, "emails": 0, "meetings": 0, "chats": 0}
+
+        def ts(value):
+            return value.isoformat() if value else None
+
+        # 1. Sync Documents (text lives in the documents.content column)
+        doc_records = []
+        for d in db.query(Document).all():
+            content = f"Document Title: {d.title}. Type: {d.document_type}. File: {d.file_name}."
+            if d.content:
+                content += "\n" + d.content
+            doc_records.append({
+                "key": f"doc-{d.document_id}",
+                "content": content,
+                "payload": {
+                    "document_id": d.document_id,
+                    "project_id": d.project_id,
+                    "department_id": d.department_id,
+                    "title": d.title,
+                    "type": d.document_type,
+                    "timestamp": ts(d.created_at),
+                },
+            })
+        stats["documents"] = self._index_records(client, "documents", doc_records)
 
         # 2. Sync Policies
-        policies = db.query(Policy).all()
-        for p in policies:
-            content = f"Policy: {p.policy_name} (Version: {p.version})\n{p.description or ''}"
-            chunks = chunk_text(content)
-            for idx, chunk in enumerate(chunks):
-                vector = self.model.encode(chunk).tolist()
-                pt_id = f"pol-{p.policy_id}-{idx}"
-                client.upsert(
-                    collection_name="policies",
-                    points=[
-                        qmodels.PointStruct(
-                            id=pt_id,
-                            vector=vector,
-                            payload={
-                                "text": chunk,
-                                "policy_id": p.policy_id,
-                                "department_id": p.department_id,
-                                "policy_name": p.policy_name,
-                                "version": p.version,
-                                "timestamp": p.created_at.isoformat() if p.created_at else None
-                            }
-                        )
-                    ]
-                )
-                stats["policies"] += 1
+        policy_records = [{
+            "key": f"pol-{p.policy_id}",
+            "content": f"Policy: {p.policy_name} (Version: {p.version})\n{p.description or ''}",
+            "payload": {
+                "policy_id": p.policy_id,
+                "department_id": p.department_id,
+                "policy_name": p.policy_name,
+                "version": p.version,
+                "timestamp": ts(p.created_at),
+            },
+        } for p in db.query(Policy).all()]
+        stats["policies"] = self._index_records(client, "policies", policy_records)
 
-        # 3. Sync Emails
-        emails = db.query(Email).all()
-        for e in emails:
-            content = f"From Sender: {e.sender_id} to Receiver: {e.receiver_id}\nSubject: {e.subject}\nBody: {e.body or ''}"
-            chunks = chunk_text(content)
-            for idx, chunk in enumerate(chunks):
-                vector = self.model.encode(chunk).tolist()
-                pt_id = f"eml-{e.email_id}-{idx}"
-                client.upsert(
-                    collection_name="emails",
-                    points=[
-                        qmodels.PointStruct(
-                            id=pt_id,
-                            vector=vector,
-                            payload={
-                                "text": chunk,
-                                "email_id": e.email_id,
-                                "sender_id": e.sender_id,
-                                "receiver_id": e.receiver_id,
-                                "subject": e.subject,
-                                "timestamp": e.sent_at.isoformat() if e.sent_at else None
-                            }
-                        )
-                    ]
-                )
-                stats["emails"] += 1
+        # 3. Sync Emails (sender_id / receiver_id are what the RBAC filter in rag_service uses)
+        email_records = [{
+            "key": f"eml-{e.email_id}",
+            "content": f"Email type: {e.email_type or 'General'}\nSubject: {e.subject}\nBody: {e.body or ''}",
+            "payload": {
+                "email_id": e.email_id,
+                "sender_id": e.sender_id,
+                "receiver_id": e.receiver_id,
+                "project_id": e.project_id,
+                "department_id": e.department_id,
+                "subject": e.subject,
+                "timestamp": ts(e.sent_at),
+            },
+        } for e in db.query(Email).all()]
+        stats["emails"] = self._index_records(client, "emails", email_records)
 
-        # 4. Sync Meetings
-        meetings = db.query(Meeting).all()
-        for m in meetings:
-            content = f"Meeting Title: {m.meeting_title} (Project ID: {m.project_id})\nMinutes:\n{m.minutes or ''}"
-            chunks = chunk_text(content)
-            for idx, chunk in enumerate(chunks):
-                vector = self.model.encode(chunk).tolist()
-                pt_id = f"mtg-{m.meeting_id}-{idx}"
-                client.upsert(
-                    collection_name="meetings",
-                    points=[
-                        qmodels.PointStruct(
-                            id=pt_id,
-                            vector=vector,
-                            payload={
-                                "text": chunk,
-                                "meeting_id": m.meeting_id,
-                                "project_id": m.project_id,
-                                "title": m.meeting_title,
-                                "timestamp": m.meeting_date.isoformat() if m.meeting_date else None
-                            }
-                        )
-                    ]
-                )
-                stats["meetings"] += 1
+        # 4. Sync Meetings (project_id is what the RBAC filter uses)
+        meeting_records = [{
+            "key": f"mtg-{m.meeting_id}",
+            "content": (
+                f"Meeting Title: {m.meeting_title} (Type: {m.meeting_type or 'General'})\n"
+                f"Agenda: {m.agenda or ''}\nMinutes:\n{m.minutes or ''}\nDecisions: {m.decision_summary or ''}"
+            ),
+            "payload": {
+                "meeting_id": m.meeting_id,
+                "project_id": m.project_id,
+                "department_id": m.department_id,
+                "organizer_id": m.organizer_id,
+                "title": m.meeting_title,
+                "timestamp": ts(m.meeting_date),
+            },
+        } for m in db.query(Meeting).all()]
+        stats["meetings"] = self._index_records(client, "meetings", meeting_records)
 
-        # 5. Sync Chat Sessions (Summary + Workflow runs)
-        chats = db.query(ChatSession).all()
-        for c in chats:
+        # 5. Sync Chat Sessions (summary + workflow outputs; employee_id is what the RBAC filter uses)
+        chat_records = []
+        for c in db.query(ChatSession).all():
             workflows = db.query(WorkflowRun).filter(WorkflowRun.session_id == c.session_id).all()
             final_outputs = " ".join([w.final_output for w in workflows if w.final_output])
-            content = f"Chat Session: {c.session_title} (Status: {c.status})\nAgent Output:\n{final_outputs}"
-            if not final_outputs:
-                content += " (No agent workflow executions recorded)."
-                
-            chunks = chunk_text(content)
-            for idx, chunk in enumerate(chunks):
-                vector = self.model.encode(chunk).tolist()
-                pt_id = f"cht-{c.session_id}-{idx}"
-                client.upsert(
-                    collection_name="chats",
-                    points=[
-                        qmodels.PointStruct(
-                            id=pt_id,
-                            vector=vector,
-                            payload={
-                                "text": chunk,
-                                "session_id": c.session_id,
-                                "employee_id": c.employee_id,
-                                "title": c.session_title,
-                                "timestamp": c.started_at.isoformat() if c.started_at else None
-                            }
-                        )
-                    ]
-                )
-                stats["chats"] += 1
+            content = f"Chat Session: {c.session_title} (Status: {c.status})"
+            if c.conversation_summary:
+                content += f"\nSummary: {c.conversation_summary}"
+            if final_outputs:
+                content += f"\nAgent Output:\n{final_outputs}"
+            chat_records.append({
+                "key": f"cht-{c.session_id}",
+                "content": content,
+                "payload": {
+                    "session_id": c.session_id,
+                    "employee_id": c.employee_id,
+                    "project_id": c.project_id,
+                    "title": c.session_title,
+                    "timestamp": ts(c.started_at),
+                },
+            })
+        stats["chats"] = self._index_records(client, "chats", chat_records)
+
+        # Payload indexes keep the RBAC and metadata filters fast
+        for collection, fields in {
+            "documents": ["project_id", "department_id"],
+            "policies": ["department_id"],
+            "emails": ["sender_id", "receiver_id", "project_id", "department_id"],
+            "meetings": ["project_id", "department_id"],
+            "chats": ["employee_id", "session_id"],
+        }.items():
+            for field in fields:
+                try:
+                    client.create_payload_index(
+                        collection_name=collection,
+                        field_name=field,
+                        field_schema=qmodels.PayloadSchemaType.INTEGER
+                    )
+                except Exception as e:
+                    logger.debug(f"Payload index {collection}.{field} not created: {e}")
 
         return stats
 
@@ -473,7 +460,7 @@ class IngestionPipelineService:
                     )
                     stats["relationships"] += 1
 
-        driver.close()
+        # The driver is shared across the application (see database.connection) - do not close it.
         return stats
 
 ingestion_pipeline = IngestionPipelineService()

@@ -17,11 +17,19 @@ class ProjectRepository(BaseRepository[Project]):
         manager_id: Optional[int] = None,
         client_id: Optional[int] = None,
         status: Optional[str] = None,
+        visible_project_ids: Optional[List[int]] = None,
         skip: int = 0,
         limit: int = 20
     ) -> Tuple[List[Project], int]:
-        """Search projects with custom filters and search patterns. Returns list and total count."""
+        """
+        Search projects with custom filters and search patterns. Returns list and total count.
+        `visible_project_ids` restricts the result to projects the caller may see (RBAC);
+        None means no restriction.
+        """
         query = db.query(Project)
+
+        if visible_project_ids is not None:
+            query = query.filter(Project.project_id.in_(visible_project_ids))
         
         # Apply filters
         if department_id:
@@ -73,6 +81,6 @@ class ProjectRepository(BaseRepository[Project]):
         query = db.query(Milestone).filter(Milestone.project_id == project_id)
         if status:
             query = query.filter(Milestone.status == status)
-        return query.order_index_by(Milestone.due_date) if hasattr(query, 'order_index_by') else query.order_by(Milestone.due_date).all()
+        return query.order_by(Milestone.due_date).all()
 
 project_repo = ProjectRepository()

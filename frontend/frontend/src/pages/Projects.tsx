@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../services/api';
-import { ListTodo, Milestone as MilestoneIcon, Calendar, User, DollarSign, ArrowRight } from 'lucide-react';
+import { ListTodo, Milestone as MilestoneIcon, Calendar, User, DollarSign } from 'lucide-react';
 
 interface ProjectItem {
   project_id: number;

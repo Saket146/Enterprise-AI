@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, Text, DECIMAL, Date, DateTime, Time, ForeignKey, Table, func
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, synonym
 from app.database.connection import Base
 
 # Model Definitions
@@ -80,14 +80,21 @@ class Client(Base):
     __tablename__ = "clients"
 
     client_id = Column(Integer, primary_key=True, index=True)
-    client_name = Column(String(200), nullable=False)
+    company_name = Column(String(200), nullable=False)
+    client_name = synonym("company_name")
     industry = Column(String(100))
+    client_size = Column(String(50))
+    annual_revenue = Column(DECIMAL(15, 2))
     contact_person = Column(String(150))
     email = Column(String(150))
     phone = Column(String(20))
     country = Column(String(100))
+    city = Column(String(100))
+    contract_value = Column(DECIMAL(15, 2))
+    account_manager = Column(Integer)
     status = Column(String(30))
     created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     # Relationships
     projects = relationship("Project", back_populates="client")
@@ -101,11 +108,16 @@ class Contract(Base):
     client_id = Column(Integer, ForeignKey("clients.client_id"), nullable=False)
     contract_number = Column(String(50), unique=True)
     contract_title = Column(String(200))
+    contract_type = Column(String(100))
     start_date = Column(Date)
     end_date = Column(Date)
     contract_value = Column(DECIMAL(15, 2))
+    renewal_date = Column(Date)
+    payment_terms = Column(String(100))
+    currency = Column(String(10))
     status = Column(String(30))
     created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     # Relationships
     client = relationship("Client", back_populates="contracts")
@@ -117,6 +129,7 @@ class Project(Base):
     project_id = Column(Integer, primary_key=True, index=True)
     project_name = Column(String(200), nullable=False)
     project_code = Column(String(30), nullable=False, unique=True)
+    contract_id = Column(Integer, ForeignKey("contracts.contract_id"))
     client_id = Column(Integer, ForeignKey("clients.client_id"))
     department_id = Column(Integer, ForeignKey("departments.department_id"))
     project_manager_id = Column(Integer, ForeignKey("employees.employee_id"))
@@ -174,6 +187,7 @@ class Task(Base):
     estimated_hours = Column(Integer)
     actual_hours = Column(Integer)
     created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     # Relationships
     project = relationship("Project", back_populates="tasks")
@@ -189,6 +203,8 @@ class Milestone(Base):
     due_date = Column(Date)
     completion_date = Column(Date)
     status = Column(String(30))
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     # Relationships
     project = relationship("Project", back_populates="milestones")
@@ -203,8 +219,10 @@ class Document(Base):
     title = Column(String(250))
     document_type = Column(String(100))
     file_name = Column(String(255))
+    content = Column(Text)
     created_by = Column(Integer, ForeignKey("employees.employee_id"))
     created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     # Relationships
     project = relationship("Project", back_populates="documents")
@@ -217,11 +235,17 @@ class Meeting(Base):
 
     meeting_id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey("projects.project_id"))
+    department_id = Column(Integer, ForeignKey("departments.department_id"))
     organizer_id = Column(Integer, ForeignKey("employees.employee_id"))
     meeting_title = Column(String(250))
+    meeting_type = Column(String(100))
     meeting_date = Column(DateTime)
+    duration_minutes = Column(Integer)
     meeting_room = Column(String(100))
+    agenda = Column(Text)
+    decision_summary = Column(Text)
     minutes = Column(Text)
+    created_at = Column(DateTime, server_default=func.now())
 
     # Relationships
     project = relationship("Project", back_populates="meetings")
@@ -234,9 +258,14 @@ class Email(Base):
     email_id = Column(Integer, primary_key=True, index=True)
     sender_id = Column(Integer, ForeignKey("employees.employee_id"))
     receiver_id = Column(Integer, ForeignKey("employees.employee_id"))
+    department_id = Column(Integer, ForeignKey("departments.department_id"))
+    project_id = Column(Integer, ForeignKey("projects.project_id"))
+    email_type = Column(String(50))
+    priority = Column(String(20))
     subject = Column(String(250))
     body = Column(Text)
     sent_at = Column(DateTime)
+    created_at = Column(DateTime, server_default=func.now())
 
     # Relationships
     sender = relationship("Employee", foreign_keys=[sender_id])
@@ -253,6 +282,7 @@ class Policy(Base):
     effective_date = Column(Date)
     description = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     # Relationships
     department = relationship("Department", back_populates="policies")
@@ -392,10 +422,19 @@ class ChatSession(Base):
 
     session_id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, ForeignKey("employees.employee_id"))
+    project_id = Column(Integer, ForeignKey("projects.project_id"))
     session_title = Column(String(250))
+    session_type = Column(String(50))
+    message_count = Column(Integer)
+    conversation_summary = Column(Text)
     started_at = Column(DateTime, server_default=func.now())
     ended_at = Column(DateTime)
     status = Column(String(30))
+    created_at = Column(DateTime, server_default=func.now())
+
+    # Relationships
+    employee = relationship("Employee", back_populates="chat_sessions")
+    workflows = relationship("WorkflowRun", back_populates="session")
 
     # Relationships
     employee = relationship("Employee", back_populates="chat_sessions")
@@ -472,4 +511,49 @@ class EvaluationRun(Base):
     score = Column(DECIMAL(6, 3), nullable=False)
     sample_count = Column(Integer, nullable=False)
     details = Column(Text)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ChatMessage(Base):
+    """
+    One message of an AI assistant chat (the user's question or the assistant's answer).
+    Stored separately from workflow_runs so the full question text, the answer and its
+    sources can be shown again when a chat is reopened.
+    """
+    __tablename__ = "chat_messages"
+
+    message_id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.session_id"), nullable=False, index=True)
+    workflow_id = Column(Integer, ForeignKey("workflow_runs.workflow_id"))
+    role = Column(String(20), nullable=False)          # "user" | "assistant"
+    content = Column(Text, nullable=False)
+    sources = Column(Text)                             # JSON list of {label, type}; assistant messages only
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class WorkflowRequest(Base):
+    """What an employee submitted in the Operations Center (the request behind a workflow run)."""
+    __tablename__ = "workflow_requests"
+
+    workflow_id = Column(Integer, ForeignKey("workflow_runs.workflow_id"), primary_key=True)
+    requested_by = Column(Integer, ForeignKey("employees.employee_id"), index=True)
+    request_type = Column(String(50), nullable=False)
+    title = Column(String(200), nullable=False)
+    details = Column(Text)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class DocumentAccessRequest(Base):
+    """
+    A request by one employee to read one document, raised in the Operations Center and
+    decided by a system administrator.  An approved row is the permission to open the document.
+    """
+    __tablename__ = "document_access_requests"
+
+    workflow_id = Column(Integer, ForeignKey("workflow_runs.workflow_id"), primary_key=True)
+    document_id = Column(Integer, ForeignKey("documents.document_id"), nullable=False, index=True)
+    employee_id = Column(Integer, ForeignKey("employees.employee_id"), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="pending")   # pending | approved | rejected
+    decided_by = Column(Integer, ForeignKey("employees.employee_id"))
+    decided_at = Column(DateTime)
     created_at = Column(DateTime, server_default=func.now())

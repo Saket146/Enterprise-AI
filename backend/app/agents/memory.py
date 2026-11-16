@@ -1,5 +1,7 @@
 import json
 import logging
+import time
+import uuid
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -13,27 +15,57 @@ class RedisShortTermMemory:
     Manages short-term conversation logs inside Redis to support quick agent memory retrieval.
     Includes in-memory local dict fallbacks to prevent crashes if Redis is offline.
     """
+    RETRY_SECONDS = 30
+    MAX_MESSAGES = 40  # keep the most recent turns only
+
     def __init__(self):
         self._fallback_store = {}
+        self.redis = None
+        self.online = False
+        self._next_retry = 0.0
+        self._connect()
+
+    def _connect(self) -> bool:
+        """(Re)connect to Redis. Called at startup and again later if Redis was offline."""
         try:
             self.redis = get_redis_client()
-            # Test connection
             self.redis.ping()
+            if not self.online:
+                logger.info("Redis short-term memory manager initialized online.")
             self.online = True
-            logger.info("Redis short-term memory manager initialized online.")
         except Exception as e:
             self.online = False
+            self._next_retry = time.time() + self.RETRY_SECONDS
             logger.warning(f"Redis is offline. Activating local in-memory session store fallback. Error: {e}")
+        return self.online
+
+    def _ensure_online(self) -> bool:
+        """Redis started after the API did? Pick it up without a restart."""
+        if not self.online and time.time() >= self._next_retry:
+            self._connect()
+        return self.online
+
+    def clear(self, session_id: int):
+        """Forget a chat session (called when the chat is deleted)."""
+        key = f"chat_session:{session_id}:history"
+        self._fallback_store.pop(key, None)
+        if self._ensure_online():
+            try:
+                self.redis.delete(key)
+            except Exception as e:
+                logger.error(f"Redis memory delete failed for session {session_id}: {e}")
 
     def get_history(self, session_id: int) -> List[Dict[str, Any]]:
         """Fetch short-term chat messages from Redis list, or local store if offline."""
         key = f"chat_session:{session_id}:history"
-        if self.online:
+        if self._ensure_online():
             try:
-                raw_msgs = self.redis.lrange(key, 0, -1)
+                raw_msgs = self.redis.lrange(key, -self.MAX_MESSAGES, -1)
                 return [json.loads(m) for m in raw_msgs]
             except Exception as e:
                 logger.error(f"Redis memory read failed for session {session_id}, reading local fallback: {e}")
+                self.online = False
+                self._next_retry = time.time() + self.RETRY_SECONDS
                 return self._fallback_store.get(key, [])
         else:
             return self._fallback_store.get(key, [])
@@ -46,12 +78,15 @@ class RedisShortTermMemory:
             "content": content,
             "timestamp": datetime.utcnow().isoformat()
         }
-        if self.online:
+        if self._ensure_online():
             try:
                 self.redis.rpush(key, json.dumps(msg))
+                self.redis.ltrim(key, -self.MAX_MESSAGES, -1)
                 self.redis.expire(key, 604800) # Keep for 7 days
             except Exception as e:
                 logger.error(f"Redis memory save failed for session {session_id}, saving locally: {e}")
+                self.online = False
+                self._next_retry = time.time() + self.RETRY_SECONDS
                 if key not in self._fallback_store:
                     self._fallback_store[key] = []
                 self._fallback_store[key].append(msg)
@@ -73,6 +108,29 @@ class LongTermMemoryManager:
             self.online = False
             logger.warning(f"Qdrant client offline. Skipping long-term vector memory indexes. Error: {e}")
 
+    @staticmethod
+    def _chats_collection_ready() -> bool:
+        """True when Qdrant is reachable and the 'chats' collection exists (checked without loading the embedding model)."""
+        try:
+            from app.services.rag_service import rag_service
+            return "chats" in rag_service._qdrant_collections()
+        except Exception:
+            return False
+
+    def forget_session(self, session_id: int):
+        """Remove everything remembered about a deleted chat from the Qdrant 'chats' collection."""
+        if not self.online or not self._chats_collection_ready():
+            return
+        try:
+            self.qdrant.delete(
+                collection_name="chats",
+                points_selector=qmodels.FilterSelector(filter=qmodels.Filter(must=[
+                    qmodels.FieldCondition(key="session_id", match=qmodels.MatchValue(value=session_id))
+                ]))
+            )
+        except Exception as e:
+            logger.error(f"Failed to remove chat {session_id} from long-term memory: {e}")
+
     def index_decision(
         self,
         session_id: int,
@@ -84,7 +142,7 @@ class LongTermMemoryManager:
         Create vector embedding of a key action/decision and index it in the Qdrant chats collection.
         Allows future RAG flows to remember past decisions.
         """
-        if not self.online:
+        if not self.online or not self._chats_collection_ready():
             return
             
         try:
@@ -93,7 +151,10 @@ class LongTermMemoryManager:
             content = f"Decision Topic: {topic}\nDetails: {decision_details}"
             vector = ingestion_pipeline.model.encode(content).tolist()
             
-            pt_id = f"dec-{session_id}-{int(datetime.utcnow().timestamp())}"
+            pt_id = str(uuid.uuid5(
+                uuid.NAMESPACE_DNS,
+                f"decision-{session_id}-{time.time_ns()}"
+            ))
             self.qdrant.upsert(
                 collection_name="chats",
                 points=[

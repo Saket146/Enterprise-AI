@@ -1,5 +1,5 @@
-from pydantic import BaseModel, EmailStr
-from typing import Optional, List
+from pydantic import BaseModel, EmailStr, model_validator
+from typing import Optional, List, Union
 from datetime import date, datetime, time
 from decimal import Decimal
 
@@ -41,6 +41,22 @@ class DepartmentResponse(DepartmentBase):
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="after")
+    def _mask_budget(self):
+        """
+        RBAC field-level masking. A department's budget is only returned to finance and
+        executive roles, or to managers for their own department. Departments are nested
+        inside employee, project, policy and document responses, so this runs for all of them.
+        """
+        from app.security.permissions import Perm, can, current_viewer
+        viewer = current_viewer.get()
+        allowed = can(viewer, Perm.FINANCE_READ) or (
+            can(viewer, Perm.FINANCE_READ_OWN_DEPT) and viewer.get("department_id") == self.department_id
+        )
+        if not allowed:
+            self.budget = None
+        return self
 
 class RoleBase(BaseModel):
     role_name: str
@@ -98,6 +114,21 @@ class EmployeeResponse(EmployeeBase):
     class Config:
         from_attributes = True
 
+    @model_validator(mode="after")
+    def _mask_sensitive_fields(self):
+        """
+        RBAC field-level masking.  Salary, date of birth and phone are only
+        returned to the employee, their direct manager, or HR/executive roles.
+        This runs wherever an employee is serialised (also when nested inside
+        projects, tasks, documents, emails and meetings).
+        """
+        from app.security.permissions import can_view_employee_sensitive, current_viewer
+        if not can_view_employee_sensitive(current_viewer.get(), self.employee_id, self.manager_id):
+            self.salary = None
+            self.date_of_birth = None
+            self.phone = None
+        return self
+
 class EmployeeListResponse(BaseModel):
     total: int
     items: List[EmployeeResponse]
@@ -107,10 +138,18 @@ class EmployeeListResponse(BaseModel):
 # ----------------------------------------------------
 class ClientResponse(BaseModel):
     client_id: int
-    client_name: str
+    company_name: Optional[str] = None
+    client_name: Optional[str] = None
     industry: Optional[str] = None
+    client_size: Optional[str] = None
+    annual_revenue: Optional[Decimal] = None
     contact_person: Optional[str] = None
     email: Optional[str] = None
+    phone: Optional[str] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
+    contract_value: Optional[Decimal] = None
+    account_manager: Optional[Union[int, str]] = None
     status: Optional[str] = None
 
     class Config:
@@ -185,6 +224,9 @@ class DocumentResponse(BaseModel):
     created_by: Optional[int] = None
     created_at: datetime
     creator: Optional[EmployeeResponse] = None
+    department: Optional[DepartmentResponse] = None
+    # For the caller: "open" (may read it), "pending" (access requested) or "request" (may ask for access)
+    my_access: Optional[str] = None
 
     class Config:
         from_attributes = True

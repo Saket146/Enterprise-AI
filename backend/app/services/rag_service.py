@@ -1,13 +1,21 @@
 import logging
-import re
-from typing import List, Dict, Any, Optional
+import time
+from typing import List, Dict, Any, Optional, Set
 import numpy as np
 from qdrant_client.http import models as qmodels
 
-from app.database.connection import get_qdrant_client, get_neo4j_driver
+from app.database.connection import SessionLocal, get_qdrant_client, get_neo4j_driver
+from app.observability import metrics
+from app.security.permissions import Perm, can, document_access, policy_access
 from app.services.pipeline_service import ingestion_pipeline
+from app.services.sql_retriever import keywords, postgres_retriever
 
 logger = logging.getLogger(__name__)
+
+COLLECTIONS = ["documents", "policies", "emails", "meetings", "chats"]
+
+# How long an unreachable store is skipped before it is tried again.
+OFFLINE_RETRY_SECONDS = 30
 
 def cosine_similarity(v1: List[float], v2: List[float]) -> float:
     """Calculate the cosine similarity between two vector lists."""
@@ -20,186 +28,285 @@ def cosine_similarity(v1: List[float], v2: List[float]) -> float:
     return float(np.dot(arr1, arr2) / (norm1 * norm2))
 
 class RAGService:
+    def __init__(self):
+        self._qdrant_retry_at = 0.0
+        self._neo4j_retry_at = 0.0
+        self._known_collections: Set[str] = set()
+        self._collections_checked_at = 0.0
+
+    # ------------------------------------------------------------------
+    # Availability (Qdrant and Neo4j are optional stores)
+    # ------------------------------------------------------------------
+    def _qdrant_collections(self) -> Set[str]:
+        """Names of the collections that exist in Qdrant; empty set when Qdrant is unreachable."""
+        now = time.time()
+        if now < self._qdrant_retry_at:
+            return set()
+        if self._known_collections and now - self._collections_checked_at < 60:
+            return self._known_collections
+        try:
+            res = get_qdrant_client().get_collections()
+            self._known_collections = {c.name for c in res.collections}
+            self._collections_checked_at = now
+            return self._known_collections
+        except Exception as e:
+            self._qdrant_retry_at = now + OFFLINE_RETRY_SECONDS
+            self._known_collections = set()
+            metrics.increment("retrieval_failures")
+            logger.warning(
+                f"Qdrant is not reachable ({str(e).splitlines()[0][:120]}). Vector search is skipped for "
+                f"{OFFLINE_RETRY_SECONDS}s; answers use PostgreSQL retrieval only."
+            )
+            return set()
+
+    # ------------------------------------------------------------------
+    # RBAC for vector search
+    # ------------------------------------------------------------------
+    def _access_conditions(self, collection_name: str, user_context: Optional[Dict[str, Any]]) -> Optional[list]:
+        """
+        Extra Qdrant filter conditions that restrict a collection to what the
+        user may read.  Returns None when the user may not search it at all.
+
+          policies            : every role except Intern
+          documents           : CEO, CTO, CFO and administrators see all; other roles only the
+                                documents they were granted access to (titles of the rest come
+                                from the PostgreSQL retriever)
+          emails              : only emails the user sent or received
+          chats               : only the user's own AI chat sessions
+          meetings            : only meetings of the user's projects
+        Roles holding the matching permission see everything.
+        """
+        # Vector hits are passages of the text itself, so they need the right to read that text
+        if collection_name == "policies":
+            return [] if policy_access(user_context) == "content" else None
+        if collection_name == "documents":
+            access = document_access(user_context)
+            if access == "content":
+                return []
+            if access == "none" or not user_context or user_context.get("employee_id") is None:
+                return None
+            db = SessionLocal()
+            try:
+                granted = sorted(postgres_retriever.granted_document_ids(db, user_context["employee_id"]))
+            finally:
+                db.close()
+            if not granted:
+                return None
+            return [qmodels.FieldCondition(key="document_id", match=qmodels.MatchAny(any=granted))]
+        if not user_context or user_context.get("employee_id") is None:
+            return None
+
+        emp_id = user_context["employee_id"]
+        if collection_name == "emails":
+            if can(user_context, Perm.PRIVATE_COMMS_ALL):
+                return []
+            return [qmodels.Filter(should=[
+                qmodels.FieldCondition(key="sender_id", match=qmodels.MatchValue(value=emp_id)),
+                qmodels.FieldCondition(key="receiver_id", match=qmodels.MatchValue(value=emp_id)),
+            ])]
+        if collection_name == "chats":
+            if can(user_context, Perm.PRIVATE_COMMS_ALL):
+                return []
+            return [qmodels.FieldCondition(key="employee_id", match=qmodels.MatchValue(value=emp_id))]
+        if collection_name == "meetings":
+            if can(user_context, Perm.PROJECTS_READ_ALL):
+                return []
+            db = SessionLocal()
+            try:
+                project_ids = sorted(postgres_retriever.user_project_ids(db, emp_id))
+            finally:
+                db.close()
+            if not project_ids:
+                return None
+            return [qmodels.FieldCondition(key="project_id", match=qmodels.MatchAny(any=project_ids))]
+        return None
+
     def search_collection(
         self,
         query: str,
         collection_name: str = "documents",
         limit: int = 5,
         project_id: Optional[int] = None,
-        department_id: Optional[int] = None
+        department_id: Optional[int] = None,
+        user_context: Optional[Dict[str, Any]] = None,
+        include_graph: bool = True
     ) -> List[Dict[str, Any]]:
         """
         Perform hybrid retrieval combining Qdrant semantic search + Neo4j relationship search,
-        fuses the context, and reranks by similarity.
+        fuses the context, and reranks by similarity.  Results are restricted to what the
+        user's job role may read.  Either store being offline only removes its share of
+        the results - it never raises.
         """
-        try:
-            client = get_qdrant_client()
-            
-            # 1. Embed query text
-            query_vector = ingestion_pipeline.model.encode(query).tolist()
-            
-            # 2. Construct Qdrant filters
-            must_conditions = []
-            if project_id is not None:
-                must_conditions.append(
-                    qmodels.FieldCondition(
-                        key="project_id",
-                        match=qmodels.MatchValue(value=project_id)
-                    )
-                )
-            if department_id is not None:
-                must_conditions.append(
-                    qmodels.FieldCondition(
-                        key="department_id",
-                        match=qmodels.MatchValue(value=department_id)
-                    )
-                )
-                
-            qdrant_filter = None
-            if must_conditions:
-                qdrant_filter = qmodels.Filter(must=must_conditions)
-                
-            # Perform vector semantic search
-            results = client.search(
-                collection_name=collection_name,
-                query_vector=query_vector,
-                query_filter=qdrant_filter,
-                limit=limit
-            )
-            
-            # Format semantic hits
-            flat_contexts = []
-            for hit in results:
-                title = hit.payload.get("title") or hit.payload.get("policy_name") or hit.payload.get("subject") or "Untitled"
-                source_label = f"Qdrant: {collection_name} - '{title}'"
-                flat_contexts.append({
-                    "id": hit.id,
-                    "text": hit.payload.get("text"),
-                    "source": source_label,
-                    "metadata": {k: v for k, v in hit.payload.items() if k != "text"},
-                    "score": hit.score
-                })
-            
-            # 3. Perform Neo4j Relationship Search to enrich context
-            neo4j_facts = self._query_neo4j(query)
-            
-            # Fuse the contexts
-            fused_contexts = flat_contexts + neo4j_facts
-            
-            # 4. Rerank the fused context chunks
-            reranked = self._rerank_contexts(query_vector, fused_contexts, limit)
-            return reranked
-            
-        except Exception as e:
-            logger.error(f"Hybrid retrieval failed on collection '{collection_name}': {e}")
+        if collection_name not in COLLECTIONS:
+            logger.warning(f"Rejected search on unknown collection '{collection_name}'.")
             return []
+
+        access = self._access_conditions(collection_name, user_context)
+        flat_contexts: List[Dict[str, Any]] = []
+        query_vector: Optional[List[float]] = None
+
+        # 1. Qdrant semantic search
+        if access is not None and collection_name in self._qdrant_collections():
+            try:
+                query_vector = ingestion_pipeline.model.encode(query).tolist()
+
+                must_conditions = list(access)
+                if project_id is not None:
+                    must_conditions.append(
+                        qmodels.FieldCondition(key="project_id", match=qmodels.MatchValue(value=project_id))
+                    )
+                if department_id is not None:
+                    must_conditions.append(
+                        qmodels.FieldCondition(key="department_id", match=qmodels.MatchValue(value=department_id))
+                    )
+                qdrant_filter = qmodels.Filter(must=must_conditions) if must_conditions else None
+
+                results = get_qdrant_client().query_points(
+                    collection_name=collection_name,
+                    query=query_vector,
+                    query_filter=qdrant_filter,
+                    limit=limit,
+                    with_payload=True
+                ).points
+
+                for hit in results:
+                    payload = hit.payload or {}
+                    title = payload.get("title") or payload.get("policy_name") or payload.get("subject") or "Untitled"
+                    flat_contexts.append({
+                        "id": hit.id,
+                        "text": payload.get("text"),
+                        "source": f"Qdrant: {collection_name} - '{title}'",
+                        "metadata": {k: v for k, v in payload.items() if k != "text"},
+                        "score": hit.score
+                    })
+            except Exception as e:
+                metrics.increment("retrieval_failures")
+                logger.error(f"Qdrant search failed on collection '{collection_name}': {e}")
+
+        # 2. Optional Neo4j enrichment. A graph outage must not discard valid Qdrant results.
+        neo4j_facts: List[Dict[str, Any]] = []
+        if include_graph:
+            try:
+                neo4j_facts = self._query_neo4j(query, user_context)
+            except Exception as e:
+                logger.warning(f"Neo4j enrichment skipped: {e}")
+
+        fused_contexts = flat_contexts + neo4j_facts
+        if not fused_contexts:
+            return []
+
+        # 3. Rerank the fused context chunks
+        return self._rerank_contexts(query_vector, fused_contexts, limit)
 
     def global_search(
         self,
         query: str,
         limit: int = 3,
         project_id: Optional[int] = None,
-        department_id: Optional[int] = None
+        department_id: Optional[int] = None,
+        user_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Perform semantic hybrid search across all enterprise collections and group results."""
-        collections = ["documents", "policies", "emails", "meetings", "chats"]
         response = {}
-        for col in collections:
-            hits = self.search_collection(
+        for idx, col in enumerate(COLLECTIONS):
+            response[col] = self.search_collection(
                 query=query,
                 collection_name=col,
                 limit=limit,
                 project_id=project_id,
-                department_id=department_id
+                department_id=department_id,
+                user_context=user_context,
+                include_graph=(idx == 0)  # graph facts once, not once per collection
             )
-            response[col] = hits
         return response
 
-    def _query_neo4j(self, query: str) -> List[Dict[str, Any]]:
+    def _query_neo4j(self, query: str, user_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         Query Neo4j knowledge graph using entity matching extracted from user prompt.
         Translates query into Cypher relationship lookups.
         """
-        facts = []
-        driver = None
-        try:
-            driver = get_neo4j_driver()
-        except Exception as e:
-            logger.warning(f"Neo4j driver offline. Skipping Graph relation lookups. Error: {e}")
+        now = time.time()
+        if now < self._neo4j_retry_at:
             return []
 
-        # Find potential entity tokens (names or words starting with capital letters or number tokens)
-        words = re.findall(r"\b[A-Za-z0-9-]+\b", query)
-        search_tokens = [w for w in words if len(w) > 2 and w.lower() not in ["and", "the", "for", "are", "you", "who"]]
-        
+        search_tokens = keywords(query)[:3]  # Limit tokens to prevent massive queries
         if not search_tokens:
             return []
 
-        with driver.session() as session:
-            for token in search_tokens[:3]:  # Limit tokens to prevent massive queries
-                # Check for Employee profile and manager reporting lines
-                emp_cypher = """
-                MATCH (e:Employee) 
-                WHERE e.name CONTAINS $token OR e.email CONTAINS $token
-                OPTIONAL MATCH (mgr:Employee)-[:MANAGES]->(e)
-                OPTIONAL MATCH (e)-[:WORKS_IN]->(d:Department)
-                RETURN e.name as name, e.email as email, e.office as office, mgr.name as manager_name, d.name as dept_name
-                LIMIT 3
-                """
-                res = session.run(emp_cypher, token=token)
-                for r in res:
-                    manager_str = f"reporting to manager {r['manager_name']}" if r['manager_name'] else "with no listed manager"
-                    dept_str = f"works in {r['dept_name']}" if r['dept_name'] else ""
-                    fact_text = f"Employee {r['name']} ({r['email']}) based in office {r['office'] or 'N/A'}. {dept_str} {manager_str}."
-                    facts.append({
-                        "id": f"neo4j-emp-{token}",
-                        "text": fact_text,
-                        "source": "Neo4j Graph: Employee Reporting Hierarchy",
-                        "metadata": {"entity": token, "type": "Employee"}
-                    })
+        can_see_projects = can(user_context, Perm.PROJECTS_READ_ALL)
+        facts = []
+        try:
+            driver = get_neo4j_driver()
+            with driver.session() as session:
+                for token in search_tokens:
+                    # Employee profile and manager reporting lines
+                    emp_cypher = """
+                    MATCH (e:Employee)
+                    WHERE toLower(e.name) CONTAINS $token OR toLower(e.email) CONTAINS $token
+                    OPTIONAL MATCH (mgr:Employee)-[:MANAGES]->(e)
+                    OPTIONAL MATCH (e)-[:WORKS_IN]->(d:Department)
+                    RETURN e.name as name, e.office as office, mgr.name as manager_name, d.name as dept_name
+                    LIMIT 3
+                    """
+                    for r in session.run(emp_cypher, token=token):
+                        manager_str = f"reporting to manager {r['manager_name']}" if r['manager_name'] else "with no listed manager"
+                        dept_str = f"works in {r['dept_name']}" if r['dept_name'] else ""
+                        facts.append({
+                            "id": f"neo4j-emp-{token}-{r['name']}",
+                            "text": f"Employee {r['name']} based in office {r['office'] or 'N/A'} {dept_str} {manager_str}.",
+                            "source": "Neo4j Graph: Employee Reporting Hierarchy",
+                            "metadata": {"entity": token, "type": "Employee"}
+                        })
 
-                # Check for Project details, manager and members
-                proj_cypher = """
-                MATCH (p:Project) 
-                WHERE p.name CONTAINS $token OR p.code CONTAINS $token
-                OPTIONAL MATCH (e:Employee)-[:MANAGES_PROJECT]->(p)
-                OPTIONAL MATCH (p)-[:BELONGS_TO]->(c:Client)
-                RETURN p.name as name, p.code as code, p.status as status, e.name as manager_name, c.name as client_name
-                LIMIT 3
-                """
-                res = session.run(proj_cypher, token=token)
-                for r in res:
-                    client_str = f"for client {r['client_name']}" if r['client_name'] else ""
-                    mgr_str = f"managed by {r['manager_name']}" if r['manager_name'] else "unassigned PM"
-                    fact_text = f"Project {r['name']} [{r['code']}] is current state '{r['status']}'. Project is {mgr_str} {client_str}."
-                    facts.append({
-                        "id": f"neo4j-proj-{token}",
-                        "text": fact_text,
-                        "source": "Neo4j Graph: Project Registry",
-                        "metadata": {"entity": token, "type": "Project"}
-                    })
+                    # Project details, manager and client - only for roles with project oversight
+                    if can_see_projects:
+                        proj_cypher = """
+                        MATCH (p:Project)
+                        WHERE toLower(p.name) CONTAINS $token OR toLower(p.code) CONTAINS $token
+                        OPTIONAL MATCH (e:Employee)-[:MANAGES_PROJECT]->(p)
+                        OPTIONAL MATCH (p)-[:BELONGS_TO]->(c:Client)
+                        RETURN p.name as name, p.code as code, p.status as status, e.name as manager_name, c.name as client_name
+                        LIMIT 3
+                        """
+                        for r in session.run(proj_cypher, token=token):
+                            client_str = f"for client {r['client_name']}" if r['client_name'] else ""
+                            mgr_str = f"managed by {r['manager_name']}" if r['manager_name'] else "unassigned PM"
+                            facts.append({
+                                "id": f"neo4j-proj-{token}-{r['code']}",
+                                "text": f"Project {r['name']} [{r['code']}] is current state '{r['status']}'. Project is {mgr_str} {client_str}.",
+                                "source": "Neo4j Graph: Project Registry",
+                                "metadata": {"entity": token, "type": "Project"}
+                            })
 
-                # Check for Department budgets
-                dept_cypher = """
-                MATCH (d:Department)
-                WHERE d.name CONTAINS $token OR d.code CONTAINS $token
-                RETURN d.name as name, d.code as code, d.location as location
-                LIMIT 3
-                """
-                res = session.run(dept_cypher, token=token)
-                for r in res:
-                    fact_text = f"Department {r['name']} ({r['code']}) located at office node {r['location'] or 'N/A'}."
-                    facts.append({
-                        "id": f"neo4j-dept-{token}",
-                        "text": fact_text,
-                        "source": "Neo4j Graph: Department Profile",
-                        "metadata": {"entity": token, "type": "Department"}
-                    })
+                    # Department profile
+                    dept_cypher = """
+                    MATCH (d:Department)
+                    WHERE toLower(d.name) CONTAINS $token OR toLower(d.code) = $token
+                    RETURN d.name as name, d.code as code, d.location as location
+                    LIMIT 3
+                    """
+                    for r in session.run(dept_cypher, token=token):
+                        facts.append({
+                            "id": f"neo4j-dept-{token}-{r['code']}",
+                            "text": f"Department {r['name']} ({r['code']}) located at office node {r['location'] or 'N/A'}.",
+                            "source": "Neo4j Graph: Department Profile",
+                            "metadata": {"entity": token, "type": "Department"}
+                        })
+        except Exception as e:
+            self._neo4j_retry_at = now + OFFLINE_RETRY_SECONDS
+            logger.warning(
+                f"Neo4j is not reachable ({str(e).splitlines()[0][:120]}). Graph lookups are skipped for "
+                f"{OFFLINE_RETRY_SECONDS}s."
+            )
+            return []
 
-        driver.close()
-        return facts
+        # De-duplicate facts found through several tokens
+        unique = {}
+        for f in facts:
+            unique.setdefault(f["text"], f)
+        return list(unique.values())
 
-    def _rerank_contexts(self, query_vector: List[float], contexts: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    def _rerank_contexts(self, query_vector: Optional[List[float]], contexts: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
         """
         Calculates the semantic similarity vectors for all contexts (including Neo4j Cypher outputs)
         against the query vector to rerank and return top relevant context entries.
@@ -207,12 +314,13 @@ class RAGService:
         if not contexts:
             return []
 
-        # Rerank items using cosine similarity scores
         scored_contexts = []
         for ctx in contexts:
             # Check if it already has a score (from Qdrant), otherwise calculate it
             if "score" in ctx and ctx.get("score") is not None:
                 score = ctx["score"]
+            elif query_vector is None:
+                score = 0.5  # No query embedding available (Qdrant offline): neutral score
             else:
                 # Generate embedding for graph facts/unscored text chunk
                 try:
@@ -221,7 +329,7 @@ class RAGService:
                 except Exception as ex:
                     logger.warning(f"Failed to generate similarity reranking vector: {ex}")
                     score = 0.5 # Default middle score if embedding fails
-            
+
             ctx["score"] = round(score, 4)
             scored_contexts.append(ctx)
 

@@ -138,13 +138,12 @@ workflow.add_edge("report_generator", "critic")
 # Conditional edge from Critic Node (rewrites or verifies)
 def route_critic(state: AgentState) -> str:
     feedback = state.get("critic_feedback", "")
-    return "rewrite" if feedback else "verify"
+    return "verify"
 
 workflow.add_conditional_edges(
     "critic",
     route_critic,
     {
-        "rewrite": "planner",
         "verify": "verification"
     }
 )

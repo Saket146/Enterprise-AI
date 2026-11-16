@@ -20,6 +20,8 @@ export const App: React.FC = () => {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [activePage, setActivePage] = useState<PageView>('dashboard');
   const [currentUser, setCurrentUser] = useState<any>(null);
+  // Roles without access to policies and documents (Interns) do not get the Knowledge Explorer menu item
+  const [showKnowledge, setShowKnowledge] = useState<boolean>(true);
 
   // Check login state on mount
   useEffect(() => {
@@ -30,6 +32,13 @@ export const App: React.FC = () => {
       setCurrentUser(JSON.parse(storedUser));
     }
   }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    api.knowledge.access()
+      .then((res: any) => setShowKnowledge(Boolean(res.can_list)))
+      .catch(() => setShowKnowledge(true));
+  }, [isAuthenticated, currentUser]);
 
   const handleLoginSuccess = () => {
     setIsAuthenticated(true);
@@ -61,7 +70,7 @@ export const App: React.FC = () => {
       case 'projects':
         return <Projects />;
       case 'knowledge':
-        return <Knowledge />;
+        return <Knowledge onOpenAssistant={() => setActivePage('ai-assistant')} />;
       case 'communications':
         return <Communications />;
       case 'ai-assistant':
@@ -80,8 +89,8 @@ export const App: React.FC = () => {
       case 'projects': return 'Enterprise Project Boards';
       case 'knowledge': return 'Central Knowledge Catalog';
       case 'communications': return 'Communications Hub';
-      case 'ai-assistant': return 'Multi-Agent AI Playground';
-      case 'operations': return 'Enterprise Operations Center';
+      case 'ai-assistant': return 'AI Assistant';
+      case 'operations': return 'Operations Center';
       default: return 'Enterprise AI OS';
     }
   };
@@ -117,12 +126,14 @@ export const App: React.FC = () => {
             <Briefcase size={18} /> Project Boards
           </li>
 
-          <li
-            onClick={() => setActivePage('knowledge')}
-            className={`sidebar-menu-item ${activePage === 'knowledge' ? 'active' : ''}`}
-          >
-            <FileText size={18} /> Knowledge Explorer
-          </li>
+          {showKnowledge && (
+            <li
+              onClick={() => setActivePage('knowledge')}
+              className={`sidebar-menu-item ${activePage === 'knowledge' ? 'active' : ''}`}
+            >
+              <FileText size={18} /> Knowledge Explorer
+            </li>
+          )}
 
           <li
             onClick={() => setActivePage('communications')}
@@ -135,7 +146,7 @@ export const App: React.FC = () => {
             onClick={() => setActivePage('ai-assistant')}
             className={`sidebar-menu-item ${activePage === 'ai-assistant' ? 'active' : ''}`}
           >
-            <BrainCircuit size={18} /> AI Assistants
+            <BrainCircuit size={18} /> AI Assistant
           </li>
           <li onClick={() => setActivePage('operations')} className={`sidebar-menu-item ${activePage === 'operations' ? 'active' : ''}`}>
             <ShieldCheck size={18} /> Operations Center

@@ -16,11 +16,13 @@ class AgentState(TypedDict):
     next_agent: str
     
     # Accumulate data chunks retrieved from Postgres, Qdrant and Neo4j
-    retrieved_context: List[Dict[str, Any]]
+    retrieved_context: Annotated[List[Dict[str, Any]], add]
     
     # Temporary workspace for report generation or feedback loops
     report_content: str
     critic_feedback: str
     
     # Store step-by-step latency, token counts and decisions for audit logs
-    agent_trace: List[Dict[str, Any]]
+    # Annotated with `add` so every node appends its trace; without a reducer LangGraph
+    # keeps only the last node's value and the audit trail would lose all earlier steps.
+    agent_trace: Annotated[List[Dict[str, Any]], add]

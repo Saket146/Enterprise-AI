@@ -40,7 +40,7 @@ class DocumentRepository(BaseRepository[Document]):
             )
             
         total = query.count()
-        results = query.offset(skip).limit(limit).all()
+        results = query.order_by(Document.document_id).offset(skip).limit(limit).all()
         return results, total
 
 
@@ -54,10 +54,14 @@ class PolicyRepository(BaseRepository[Policy]):
         *,
         search_query: Optional[str] = None,
         department_id: Optional[int] = None,
+        search_text: bool = True,
         skip: int = 0,
         limit: int = 20
     ) -> Tuple[List[Policy], int]:
-        """Search policies using database fields. Returns policy list and total count."""
+        """
+        Search policies using database fields. Returns policy list and total count.
+        With search_text=False only the policy name is searched, not the policy text.
+        """
         query = db.query(Policy)
         
         if department_id:
@@ -65,15 +69,18 @@ class PolicyRepository(BaseRepository[Policy]):
             
         if search_query:
             search_pattern = f"%{search_query}%"
-            query = query.filter(
-                or_(
-                    Policy.policy_name.ilike(search_pattern),
-                    Policy.description.ilike(search_pattern)
+            if search_text:
+                query = query.filter(
+                    or_(
+                        Policy.policy_name.ilike(search_pattern),
+                        Policy.description.ilike(search_pattern)
+                    )
                 )
-            )
+            else:
+                query = query.filter(Policy.policy_name.ilike(search_pattern))
             
         total = query.count()
-        results = query.offset(skip).limit(limit).all()
+        results = query.order_by(Policy.policy_name, Policy.policy_id).offset(skip).limit(limit).all()
         return results, total
 
 document_repo = DocumentRepository()

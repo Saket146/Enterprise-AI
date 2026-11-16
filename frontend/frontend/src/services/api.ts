@@ -34,7 +34,13 @@ const request = async (
     
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.detail || 'An error occurred during network request.');
+      // FastAPI sends `detail` as text, or as a list of validation problems
+      const detail = Array.isArray(errorData.detail)
+        ? errorData.detail.map((d: any) => d.msg || String(d)).join('; ')
+        : errorData.detail;
+      const error = new Error(detail || 'An error occurred during network request.') as Error & { status?: number };
+      error.status = response.status;
+      throw error;
     }
     
     return await response.json();
@@ -67,6 +73,7 @@ export const api = {
       window.location.href = '/login';
     },
     getProfile: () => request('/api/auth/profile'),
+    getPermissions: () => request('/api/auth/permissions'),
   },
   
   employees: {
@@ -160,6 +167,15 @@ export const api = {
       });
       return request(`/api/knowledge/semantic-search?${q.toString()}`);
     },
+    // What the current role may see: "content" (open and read), "titles" (list only) or "none"
+    access: () => request('/api/knowledge/access'),
+    openDocument: (id: number) => request(`/api/knowledge/documents/${id}`),
+    openPolicy: (id: number) => request(`/api/knowledge/policies/${id}`),
+    // Source search used inside the AI Assistant (database keyword matches + vector matches when available)
+    search: (query: string, scope: string = 'all', limit: number = 8) => {
+      const q = new URLSearchParams({ query, scope, limit: String(limit) });
+      return request(`/api/knowledge/search?${q.toString()}`);
+    },
   },
   
   communications: {
@@ -167,11 +183,21 @@ export const api = {
     getMeetings: () => request('/api/communications/meetings'),
     getChats: () => request('/api/communications/chats'),
     getChat: (id: number) => request(`/api/communications/chats/${id}`),
-    createChat: (title: string) => request(`/api/communications/chats?title=${encodeURIComponent(title)}`, {
+    // A chat created without a title is named automatically from its first question
+    createChat: (title?: string) => request('/api/communications/chats', {
       method: 'POST',
+      body: JSON.stringify(title ? { title } : {}),
     }),
-    sendMessage: (id: number, text: string) => request(`/api/communications/chats/${id}/message?message=${encodeURIComponent(text)}`, {
+    renameChat: (id: number, title: string) => request(`/api/communications/chats/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title }),
+    }),
+    deleteChat: (id: number) => request(`/api/communications/chats/${id}`, {
+      method: 'DELETE',
+    }),
+    sendMessage: (id: number, text: string) => request(`/api/communications/chats/${id}/message`, {
       method: 'POST',
+      body: JSON.stringify({ message: text }),
     }),
   },
   
@@ -180,10 +206,18 @@ export const api = {
     syncNeo4j: () => request('/api/ingestion/neo4j', { method: 'POST' }),
   },
   workflows: {
-    run: (data: { workflow_type: string; title: string; payload: string; requires_approval: boolean }) => request('/api/workflows/run', { method: 'POST', body: JSON.stringify(data) }),
+    types: () => request('/api/workflows/types'),
+    run: (data: { workflow_type: string; title: string; payload: string; document_id?: number; requires_approval?: boolean }) => request('/api/workflows/run', { method: 'POST', body: JSON.stringify(data) }),
+    requests: (scope: 'mine' | 'all' = 'mine') => request(`/api/workflows/requests?scope=${scope}`),
     runs: () => request('/api/workflows/runs'),
+    approvals: () => request('/api/workflows/approvals'),
+    decide: (approvalId: number, approved: boolean, note: string) => request(`/api/workflows/approvals/${approvalId}`, { method: 'POST', body: JSON.stringify({ approved, note }) }),
   },
   analytics: { overview: () => request('/api/analytics/overview') },
   monitoring: { dashboard: () => request('/api/monitoring/dashboard') },
-  evaluations: { run: () => request('/api/evaluations/run', { method: 'POST' }) }
+  evaluations: {
+    run: () => request('/api/evaluations/run', { method: 'POST' }),
+    history: () => request('/api/evaluations/history'),
+  },
+  system: { dependencies: () => request('/health/dependencies') },
 };

@@ -1,552 +1,617 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../services/api';
-import { 
-  Send, Plus, BrainCircuit, Terminal, Percent, Clock, CheckCircle, 
-  Activity, ArrowRight, ShieldAlert, Sparkles, FileText, Database, GitMerge
+import { Markdown } from '../components/Markdown';
+import {
+  ArrowUp, Check, ChevronDown, ChevronRight, Copy, Database, FileText, GitMerge,
+  MessageSquare, MoreHorizontal, Pencil, Plus, Search, ShieldAlert, Sparkles, Trash2, X,
 } from 'lucide-react';
 
-interface AgentLog {
-  agent_log_id: number;
-  agent_name: string;
-  task_description: string;
-  input_data: string;
-  output_data: string;
-  execution_time_ms: number;
-  confidence_score: number;
-}
-
-interface WorkflowRun {
-  workflow_id: number;
-  workflow_name: string;
-  status: string;
-  final_output: string;
-  confidence_score: number;
-  agent_logs: AgentLog[];
-}
-
-interface ChatSession {
+interface ChatSummary {
   session_id: number;
   session_title: string;
-  status: string;
-  workflows: WorkflowRun[];
+  started_at: string;
+  last_activity_at: string;
+  message_count: number;
 }
 
-interface DisplayMessage {
+interface Source { label: string; type: string; }
+
+interface Step {
+  agent: string;
+  description: string;
+  duration_ms: number | null;
+}
+
+interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
-  sources?: string[];
-  agentLogs?: AgentLog[];
-  isStreaming?: boolean;
+  sources?: Source[];
+  steps?: Step[];
+  notice?: boolean;   // a local notice (blocked message or error), not stored on the server
 }
 
+interface SearchResult {
+  title: string;
+  type: string;
+  text: string;
+  details: string[];
+  score: number;
+  store: string;
+  restricted?: boolean;   // the title is visible, the text is not (role cannot open it)
+}
+
+const SUGGESTIONS = [
+  { title: 'Look someone up', prompt: 'Who is the CEO?' },
+  { title: 'Count and compare', prompt: 'How many employees are there by department?' },
+  { title: 'Find a policy', prompt: 'What is the leave management policy?' },
+  { title: 'Check my work', prompt: 'What are my open tasks?' },
+];
+
+// Plain-language names for the agents that work on an answer
+const STEP_NAMES: Record<string, string> = {
+  PlannerAgent: 'Understood the question',
+  RetrievalAgent: 'Searched company data',
+  HRAgent: 'Checked employee and policy records',
+  FinanceAgent: 'Checked budget records',
+  SalesAgent: 'Checked client and contract records',
+  EngineeringAgent: 'Checked project records',
+  AnalyticsAgent: 'Calculated from company data',
+  DocumentAgent: 'Searched documents',
+  ReportGeneratorAgent: 'Wrote the answer',
+  CriticAgent: 'Reviewed the answer',
+  VerificationAgent: 'Verified facts and removed personal data',
+};
+
+const relativeTime = (iso: string): string => {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '';
+  const minutes = Math.round((Date.now() - then) / 60000);
+  if (minutes < 1) return 'Just now';
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 7) return `${days} d ago`;
+  return new Date(iso).toLocaleDateString();
+};
+
+const sourceIcon = (type: string) => {
+  if (type === 'documents') return <FileText size={12} />;
+  if (type === 'graph') return <GitMerge size={12} />;
+  return <Database size={12} />;
+};
+
 export const AIAssistant: React.FC = () => {
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
-  const [sessionDetails, setSessionDetails] = useState<ChatSession | null>(null);
-  const [newTitle, setNewTitle] = useState<string>('');
-  const [inputText, setInputText] = useState<string>('');
-  const [loading, setLoading] = useState<boolean>(false);
-  const [sessionsLoading, setSessionsLoading] = useState<boolean>(true);
-  
-  // Custom states for premium streaming and timeline
-  const [displayMessages, setDisplayMessages] = useState<DisplayMessage[]>([]);
-  const [activeStepIndex, setActiveStepIndex] = useState<number>(-1);
-  const [simulatedLogs, setSimulatedLogs] = useState<AgentLog[]>([]);
-  const [showTimeline, setShowTimeline] = useState<boolean>(true);
-  const [selectedSourceDetail, setSelectedSourceDetail] = useState<string | null>(null);
-
-  const chatEndRef = useRef<HTMLDivElement>(null);
-
-  const loadSessions = async (selectFirst = false) => {
-    setSessionsLoading(true);
-    try {
-      const res = await api.communications.getChats();
-      setSessions(res || []);
-      if (selectFirst && res && res.length > 0) {
-        setSelectedSessionId(res[0].session_id);
-      }
-    } catch (err) {
-      console.error('Failed to load chat sessions:', err);
-    } finally {
-      setSessionsLoading(false);
-    }
-  };
-
-  // Load chat sessions on mount
-  useEffect(() => {
-    loadSessions(true);
+  const user = useMemo(() => {
+    try { return JSON.parse(localStorage.getItem('user') || '{}'); } catch { return {}; }
   }, []);
 
-  // Build display messages list when session details change
-  useEffect(() => {
-    if (!sessionDetails) {
-      setDisplayMessages([]);
-      return;
-    }
+  // Chat list
+  const [chats, setChats] = useState<ChatSummary[]>([]);
+  const [chatsLoading, setChatsLoading] = useState(true);
+  const [chatFilter, setChatFilter] = useState('');
+  const [activeId, setActiveId] = useState<number | null>(null);   // null = a new, not yet saved chat
+  const [menuFor, setMenuFor] = useState<number | null>(null);
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [deleteTarget, setDeleteTarget] = useState<ChatSummary | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [listError, setListError] = useState('');
 
-    const msgs: DisplayMessage[] = [];
-    sessionDetails.workflows?.forEach((wf) => {
-      // Extract user prompt from workflow name
-      const userPrompt = wf.workflow_name
-        .replace("Enterprise QA: ", "")
-        .replace("...", "");
-      
-      msgs.push({
-        id: `user-${wf.workflow_id}`,
-        role: 'user',
-        content: userPrompt
-      });
+  // Conversation
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messagesLoading, setMessagesLoading] = useState(false);
+  const [input, setInput] = useState('');
+  const [sending, setSending] = useState(false);
+  const [openSteps, setOpenSteps] = useState<Record<string, boolean>>({});
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
-      // Parse sources from final output
-      const parsed = parseSources(wf.final_output);
+  // Source search panel (the former "AI Vector Search" of the Knowledge Explorer)
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchScope, setSearchScope] = useState('all');
+  const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
+  const [searchVector, setSearchVector] = useState(true);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState('');
 
-      msgs.push({
-        id: `assistant-${wf.workflow_id}`,
-        role: 'assistant',
-        content: parsed.cleanText,
-        sources: parsed.sources,
-        agentLogs: wf.agent_logs
-      });
-    });
+  const endRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const skipLoadFor = useRef<number | null>(null);
+  const renameDone = useRef(false);   // Enter/Escape already handled the rename; ignore the blur that follows
 
-    setDisplayMessages(msgs);
-    setSimulatedLogs([]);
-    setActiveStepIndex(-1);
-  }, [sessionDetails]);
+  const activeChat = chats.find((c) => c.session_id === activeId) || null;
 
-  // Scroll to bottom on updates
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [displayMessages, simulatedLogs, loading]);
-
-  // Load active chat details when session changes
-  useEffect(() => {
-    if (selectedSessionId === null) return;
-    
-    const loadChatDetails = async () => {
-      try {
-        const details = await api.communications.getChat(selectedSessionId);
-        setSessionDetails(details);
-      } catch (err) {
-        console.error('Failed to load session details:', err);
-      }
-    };
-    loadChatDetails();
-  }, [selectedSessionId]);
-
-  // Helper to extract source references from markdown
-  const parseSources = (text: string) => {
-    if (!text) return { cleanText: "", sources: [] };
-    
-    // Find all occurrences of [Qdrant: ...] or [Neo4j: ...] or Source: ...
-    const sourceRegex = /\[(Qdrant|Neo4j|SQL|Postgres|Reference).*?\]/g;
-    const matches = text.match(sourceRegex) || [];
-    
-    // Clean text by removing brackets patterns
-    let cleanText = text;
-    matches.forEach(m => {
-      cleanText = cleanText.replace(m, "");
-    });
-    
-    // Also cleanup residual headers or double sources blocks
-    if (cleanText.includes("### Verified Sources")) {
-      cleanText = cleanText.split("### Verified Sources")[0];
-    }
-    if (cleanText.includes("### Sources")) {
-      cleanText = cleanText.split("### Sources")[0];
-    }
-
-    return {
-      cleanText: cleanText.trim(),
-      sources: matches.map(m => m.replace(/[\[\]]/g, ""))
-    };
-  };
-
-  const handleCreateSession = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newTitle.trim()) return;
+  const loadChats = useCallback(async () => {
     try {
-      const newSession = await api.communications.createChat(newTitle);
-      setNewTitle('');
-      await loadSessions();
-      setSelectedSessionId(newSession.session_id);
-    } catch (err) {
-      console.error('Failed to create session:', err);
-    }
-  };
-
-  // Premium Streaming & timeline simulation
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputText.trim() || selectedSessionId === null) return;
-
-    setLoading(true);
-    const userMsg = inputText;
-    setInputText('');
-
-    // Optimistically add user query to thread list
-    setDisplayMessages(prev => [
-      ...prev,
-      { id: `temp-user-${Date.now()}`, role: 'user', content: userMsg }
-    ]);
-
-    try {
-      // 1. Fetch response from LangGraph backend
-      const runRes = await api.communications.sendMessage(selectedSessionId, userMsg);
-      const logs = runRes.agent_logs || [];
-      
-      // 2. Animate Agent Timeline steps sequentially
-      setSimulatedLogs([]);
-      for (let i = 0; i < logs.length; i++) {
-        setActiveStepIndex(i);
-        setSimulatedLogs(prev => [...prev, logs[i]]);
-        // Delay to show reasoning step
-        await new Promise(resolve => setTimeout(resolve, 800));
-      }
-      setActiveStepIndex(-1);
-
-      // 3. Simulates word-by-word streaming of final response
-      const { cleanText, sources } = parseSources(runRes.final_output);
-      const words = cleanText.split(" ");
-      let currentText = "";
-      
-      const streamId = `stream-assistant-${runRes.workflow_id}`;
-      // Add empty assistant bubble
-      setDisplayMessages(prev => [
-        ...prev,
-        { id: streamId, role: 'assistant', content: "", isStreaming: true, agentLogs: logs }
-      ]);
-
-      for (let w = 0; w < words.length; w++) {
-        currentText += (w === 0 ? "" : " ") + words[w];
-        setDisplayMessages(prev => 
-          prev.map(m => m.id === streamId ? { ...m, content: currentText } : m)
-        );
-        // Custom delay per word
-        await new Promise(resolve => setTimeout(resolve, 35));
-      }
-
-      // Mark streaming as complete, attach sources
-      setDisplayMessages(prev => 
-        prev.map(m => m.id === streamId ? { ...m, isStreaming: false, sources } : m)
-      );
-
-      // Refresh final chat state from DB
-      const details = await api.communications.getChat(selectedSessionId);
-      setSessionDetails(details);
-
-    } catch (err) {
-      console.error('Failed to transmit message:', err);
-      setDisplayMessages(prev => [
-        ...prev,
-        { id: `err-${Date.now()}`, role: 'assistant', content: "🚨 Failed to receive agent completion. Please check backend server log connections." }
-      ]);
+      const res = await api.communications.getChats();
+      setChats(Array.isArray(res) ? res : []);
+      setListError('');
+    } catch (err: any) {
+      setListError(err?.message || 'Could not load your chats.');
     } finally {
-      setLoading(false);
-      setSimulatedLogs([]);
+      setChatsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadChats(); }, [loadChats]);
+
+  // Load the messages of the selected chat
+  useEffect(() => {
+    if (activeId === null) { return; }
+    if (skipLoadFor.current === activeId) { skipLoadFor.current = null; return; }
+    let cancelled = false;
+    setMessagesLoading(true);
+    setMessages([]);
+    api.communications.getChat(activeId)
+      .then((detail) => { if (!cancelled) setMessages(detail.messages || []); })
+      .catch((err: any) => {
+        if (!cancelled) setMessages([{ id: 'load-error', role: 'assistant', notice: true, content: err?.message || 'This chat could not be loaded.' }]);
+      })
+      .finally(() => { if (!cancelled) setMessagesLoading(false); });
+    return () => { cancelled = true; };
+  }, [activeId]);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [messages, sending]);
+
+  // Close the row menu when clicking anywhere else
+  useEffect(() => {
+    if (menuFor === null) return;
+    const close = () => setMenuFor(null);
+    window.addEventListener('click', close);
+    return () => window.removeEventListener('click', close);
+  }, [menuFor]);
+
+  // Grow the input with its content
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
+  }, [input]);
+
+  const startNewChat = () => {
+    setActiveId(null);
+    setMessages([]);
+    setInput('');
+    setRenamingId(null);
+    inputRef.current?.focus();
+  };
+
+  const selectChat = (id: number) => {
+    if (id === activeId || sending) return;
+    setRenamingId(null);
+    setActiveId(id);
+  };
+
+  const send = async (text: string) => {
+    const question = text.trim();
+    if (!question || sending) return;
+
+    setSending(true);
+    setInput('');
+    const tempId = `pending-${Date.now()}`;
+    setMessages((prev) => [...prev, { id: tempId, role: 'user', content: question }]);
+
+    let chatId = activeId;
+    let createdNow = false;
+    try {
+      if (chatId === null) {
+        // The chat is created on the first question and named automatically by the server
+        const created = await api.communications.createChat();
+        chatId = created.session_id as number;
+        createdNow = true;
+        skipLoadFor.current = chatId;
+        setChats((prev) => [created, ...prev]);
+        setActiveId(chatId);
+      }
+
+      const reply = await api.communications.sendMessage(chatId, question);
+      setMessages((prev) => [
+        ...prev.filter((m) => m.id !== tempId),
+        reply.user_message,
+        reply.answer,
+      ]);
+      setChats((prev) => {
+        const updated = prev.map((c) => c.session_id === chatId
+          ? { ...c, session_title: reply.session_title, last_activity_at: new Date().toISOString(), message_count: c.message_count + 2 }
+          : c);
+        // Most recently used chat first
+        const current = updated.find((c) => c.session_id === chatId);
+        return current ? [current, ...updated.filter((c) => c.session_id !== chatId)] : updated;
+      });
+    } catch (err: any) {
+      const blocked = err?.status === 400;
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `notice-${Date.now()}`,
+          role: 'assistant',
+          notice: true,
+          content: blocked
+            ? `${err.message || "I can't process that message."} Please rephrase your question.`
+            : `Something went wrong and I couldn't answer. ${err?.message || ''}`,
+        },
+      ]);
+      if (createdNow && chatId !== null) {
+        // Nothing was saved in the brand-new chat: remove it instead of leaving an empty "New chat" behind
+        const emptyId = chatId;
+        api.communications.deleteChat(emptyId).catch(() => undefined);
+        setChats((prev) => prev.filter((c) => c.session_id !== emptyId));
+        skipLoadFor.current = null;
+        setActiveId(null);
+      }
+    } finally {
+      setSending(false);
+      inputRef.current?.focus();
     }
   };
 
-  const getSourceIcon = (src: string) => {
-    if (src.toLowerCase().includes('qdrant')) return <FileText size={12} className="source-icon qdrant" />;
-    if (src.toLowerCase().includes('neo4j') || src.toLowerCase().includes('graph')) return <GitMerge size={12} className="source-icon neo4j" />;
-    return <Database size={12} className="source-icon sql" />;
+  const handleSubmit = (e: React.FormEvent) => { e.preventDefault(); send(input); };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(input); }
   };
+
+  // ---- Rename ---------------------------------------------------------
+  const beginRename = (chat: ChatSummary) => {
+    setMenuFor(null);
+    renameDone.current = false;
+    setRenamingId(chat.session_id);
+    setRenameValue(chat.session_title);
+  };
+
+  const cancelRename = () => {
+    renameDone.current = true;
+    setRenamingId(null);
+  };
+
+  const commitRename = async () => {
+    const id = renamingId;
+    if (id === null || renameDone.current) return;
+    renameDone.current = true;
+    const title = renameValue.trim();
+    const current = chats.find((c) => c.session_id === id);
+    setRenamingId(null);
+    if (!title || !current || title === current.session_title) return;
+    try {
+      const updated = await api.communications.renameChat(id, title);
+      setChats((prev) => prev.map((c) => (c.session_id === id ? { ...c, session_title: updated.session_title } : c)));
+    } catch (err: any) {
+      setListError(err?.message || 'The chat could not be renamed.');
+    }
+  };
+
+  // ---- Delete ---------------------------------------------------------
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    try {
+      await api.communications.deleteChat(deleteTarget.session_id);
+      setChats((prev) => prev.filter((c) => c.session_id !== deleteTarget.session_id));
+      if (activeId === deleteTarget.session_id) { setActiveId(null); setMessages([]); }
+      setDeleteTarget(null);
+    } catch (err: any) {
+      setListError(err?.message || 'The chat could not be deleted.');
+      setDeleteTarget(null);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const copyAnswer = async (msg: ChatMessage) => {
+    try {
+      await navigator.clipboard.writeText(msg.content);
+      setCopiedId(msg.id);
+      setTimeout(() => setCopiedId((current) => (current === msg.id ? null : current)), 1500);
+    } catch { /* clipboard not available */ }
+  };
+
+  // ---- Source search --------------------------------------------------
+  const runSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (searchQuery.trim().length < 2) return;
+    setSearching(true);
+    setSearchError('');
+    try {
+      const res = await api.knowledge.search(searchQuery.trim(), searchScope);
+      setSearchResults(res.results || []);
+      setSearchVector(Boolean(res.vector_search_available));
+    } catch (err: any) {
+      setSearchResults(null);
+      setSearchError(err?.message || 'The search failed.');
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const askAbout = (result: SearchResult) => {
+    setInput(`Tell me about "${result.title}"`);
+    inputRef.current?.focus();
+  };
+
+  const visibleChats = chats.filter((c) => c.session_title.toLowerCase().includes(chatFilter.trim().toLowerCase()));
+  const showWelcome = messages.length === 0 && !messagesLoading && !sending;
 
   return (
-    <div className="animated-fade-in chat-container">
-      {/* 1. Sidebar conversation list */}
-      <div className="glass-card chat-sidebar" style={{ display: 'flex', flexDirection: 'column' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'between', marginBottom: '8px' }}>
-          <h3 style={{ fontSize: '1.05rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <BrainCircuit size={18} style={{ color: 'var(--color-primary)' }} /> Session Registry
-          </h3>
-        </div>
-        
-        <form onSubmit={handleCreateSession} style={{ display: 'flex', gap: '8px' }}>
-          <input
-            className="input-field"
-            type="text"
-            placeholder="New session title..."
-            value={newTitle}
-            onChange={(e) => setNewTitle(e.target.value)}
-            required
-            style={{ padding: '8px 12px', fontSize: '0.85rem' }}
-          />
-          <button className="btn btn-primary" type="submit" style={{ padding: '8px 12px' }}>
-            <Plus size={16} />
-          </button>
-        </form>
+    <div className="animated-fade-in ai-layout">
+      {/* ---------------- Chat list ---------------- */}
+      <aside className="glass-card ai-sidebar">
+        <button className="btn btn-primary ai-new-chat" onClick={startNewChat} disabled={sending}>
+          <Plus size={16} /> New chat
+        </button>
 
-        <div className="chat-history-list" style={{ flexGrow: 1, marginTop: '12px' }}>
-          {sessionsLoading ? (
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Loading threads...</p>
-          ) : sessions.length === 0 ? (
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>No sessions found.</p>
+        <div className="ai-filter">
+          <Search size={14} />
+          <input
+            type="text"
+            placeholder="Search your chats"
+            value={chatFilter}
+            onChange={(e) => setChatFilter(e.target.value)}
+            aria-label="Search your chats"
+          />
+        </div>
+
+        {listError && <div className="ai-inline-error">{listError}</div>}
+
+        <div className="ai-chat-list">
+          {chatsLoading ? (
+            <p className="ai-muted">Loading chats...</p>
+          ) : visibleChats.length === 0 ? (
+            <p className="ai-muted">{chats.length === 0 ? 'No chats yet. Ask your first question to start one.' : 'No chats match your search.'}</p>
           ) : (
-            sessions.map(s => (
+            visibleChats.map((chat) => (
               <div
-                key={s.session_id}
-                onClick={() => setSelectedSessionId(s.session_id)}
-                className={`chat-session-item ${selectedSessionId === s.session_id ? 'active' : ''}`}
-                style={{ padding: '12px', borderRadius: '10px', marginBottom: '8px' }}
+                key={chat.session_id}
+                className={`ai-chat-row ${activeId === chat.session_id ? 'active' : ''}`}
+                onClick={() => selectChat(chat.session_id)}
               >
-                <div style={{ fontWeight: 600, fontSize: '0.88rem', marginBottom: '4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {s.session_title}
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                  <span>ID: #{s.session_id}</span>
-                  <span style={{ textTransform: 'capitalize' }}>● {s.status}</span>
-                </div>
+                {renamingId === chat.session_id ? (
+                  <input
+                    className="ai-rename-input"
+                    autoFocus
+                    value={renameValue}
+                    maxLength={120}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onBlur={commitRename}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitRename();
+                      if (e.key === 'Escape') cancelRename();
+                    }}
+                    aria-label="Chat name"
+                  />
+                ) : (
+                  <>
+                    <div className="ai-chat-row-text">
+                      <div className="ai-chat-title" title={chat.session_title}>{chat.session_title}</div>
+                      <div className="ai-chat-time">{relativeTime(chat.last_activity_at)}</div>
+                    </div>
+                    <button
+                      className="ai-icon-btn ai-row-menu-btn"
+                      title="Chat options"
+                      aria-label="Chat options"
+                      onClick={(e) => { e.stopPropagation(); setMenuFor(menuFor === chat.session_id ? null : chat.session_id); }}
+                    >
+                      <MoreHorizontal size={16} />
+                    </button>
+                    {menuFor === chat.session_id && (
+                      <div className="ai-row-menu" onClick={(e) => e.stopPropagation()}>
+                        <button onClick={() => beginRename(chat)}><Pencil size={14} /> Rename</button>
+                        <button className="danger" onClick={() => { setMenuFor(null); setDeleteTarget(chat); }}><Trash2 size={14} /> Delete</button>
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
             ))
           )}
         </div>
-      </div>
+      </aside>
 
-      {/* 2. Main Active Playground */}
-      <div className="glass-card chat-main" style={{ display: 'flex', flexDirection: 'column', flexGrow: 1 }}>
-        {selectedSessionId !== null && sessionDetails ? (
-          <>
-            {/* Thread Header */}
-            <div style={{ paddingBottom: '16px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                <h4 style={{ fontSize: '1.15rem', fontWeight: 700, color: 'var(--text-primary)' }}>{sessionDetails.session_title}</h4>
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <Activity size={12} style={{ color: 'var(--color-success)' }} /> LangGraph Multi-Agent Fabric Layer
+      {/* ---------------- Conversation ---------------- */}
+      <section className="glass-card ai-main">
+        <header className="ai-header">
+          <div className="ai-header-title">
+            <MessageSquare size={16} />
+            <span title={activeChat?.session_title || 'New chat'}>{activeChat?.session_title || 'New chat'}</span>
+            {activeChat && (
+              <>
+                <button className="ai-icon-btn" title="Rename chat" aria-label="Rename chat" onClick={() => beginRename(activeChat)}><Pencil size={14} /></button>
+                <button className="ai-icon-btn" title="Delete chat" aria-label="Delete chat" onClick={() => setDeleteTarget(activeChat)}><Trash2 size={14} /></button>
+              </>
+            )}
+          </div>
+          <button className={`btn btn-secondary ai-search-toggle ${searchOpen ? 'on' : ''}`} onClick={() => setSearchOpen(!searchOpen)}>
+            <Search size={14} /> Search sources
+          </button>
+        </header>
+
+        <div className="ai-messages">
+          <div className="ai-column">
+            {messagesLoading && <p className="ai-muted" style={{ textAlign: 'center' }}>Loading conversation...</p>}
+
+            {showWelcome && (
+              <div className="ai-welcome">
+                <div className="ai-welcome-icon"><Sparkles size={26} /></div>
+                <h2>{user.first_name ? `Hi ${user.first_name}, what would you like to know?` : 'What would you like to know?'}</h2>
+                <p>
+                  Ask about people, departments, projects, clients, budgets and policies.
+                  Answers come from the company database and only include what your role{user.role ? ` (${user.role})` : ''} is allowed to see.
                 </p>
-              </div>
-              <div style={{ display: 'flex', gap: '10px' }}>
-                <button 
-                  onClick={() => setShowTimeline(!showTimeline)} 
-                  className="btn btn-secondary" 
-                  style={{ padding: '6px 12px', fontSize: '0.75rem', borderRadius: '20px' }}
-                >
-                  {showTimeline ? "Hide Execution Traces" : "Show Execution Traces"}
-                </button>
-                <span className="badge badge-success" style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', height: '28px' }}>
-                  <CheckCircle size={12} /> Guardrails Enabled
-                </span>
-              </div>
-            </div>
-
-            {/* Conversation list viewport */}
-            <div className="chat-messages" style={{ flexGrow: 1, padding: '20px 8px', overflowY: 'auto' }}>
-              
-              {/* Core greeting */}
-              <div className="chat-message agent">
-                <div className="sidebar-avatar" style={{ background: 'var(--accent-gradient)', color: 'white' }}>Ω</div>
-                <div className="message-bubble" style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-color)' }}>
-                  <p style={{ fontWeight: 500 }}>Welcome to the Enterprise AI Reasoning Playground.</p>
-                  <p style={{ marginTop: '6px', color: 'var(--text-secondary)' }}>
-                    I can dispatch tasks across 11 autonomous agents, parse files, execute secure SQL queries, traverse the Neo4j Knowledge Graph, and enforce guardrails. How can I help your automation workflow?
-                  </p>
+                <div className="ai-suggestions">
+                  {SUGGESTIONS.map((s) => (
+                    <button key={s.prompt} onClick={() => send(s.prompt)}>
+                      <strong>{s.title}</strong>
+                      <span>{s.prompt}</span>
+                    </button>
+                  ))}
                 </div>
               </div>
+            )}
 
-              {/* Loop messages list */}
-              {displayMessages.map((msg) => (
-                <div key={msg.id} className={`chat-message ${msg.role}`}>
-                  <div className="sidebar-avatar" style={{
-                    background: msg.role === 'user' ? 'var(--color-primary)' : 'var(--bg-tertiary)',
-                    border: msg.role === 'user' ? 'none' : '2px solid var(--color-primary)',
-                    color: 'white'
-                  }}>
-                    {msg.role === 'user' ? 'U' : 'AI'}
-                  </div>
-                  <div className="message-bubble" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    <div style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
-                    
-                    {/* Render Interactive Source Badges */}
+            {messages.map((msg) => (
+              msg.role === 'user' ? (
+                <div key={msg.id} className="ai-msg ai-msg-user">
+                  <div className="ai-user-bubble">{msg.content}</div>
+                </div>
+              ) : (
+                <div key={msg.id} className={`ai-msg ai-msg-assistant ${msg.notice ? 'notice' : ''}`}>
+                  <div className="ai-avatar">{msg.notice ? <ShieldAlert size={15} /> : <Sparkles size={15} />}</div>
+                  <div className="ai-answer">
+                    <Markdown text={msg.content} />
+
                     {msg.sources && msg.sources.length > 0 && (
-                      <div style={{ marginTop: '12px', borderTop: '1px dashed var(--border-color)', paddingTop: '10px' }}>
-                        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '6px', fontWeight: 600 }}>RETRIEVED SOURCE CITATIONS:</div>
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-                          {msg.sources.map((src, sIdx) => (
-                            <button
-                              key={sIdx}
-                              onClick={() => setSelectedSourceDetail(src)}
-                              className="badge btn-secondary"
-                              style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)' }}
-                            >
-                              {getSourceIcon(src)}
-                              <span>{src.replace(/qdrant:|neo4j:|sql:/i, '').trim()}</span>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Reasoning traces details collapsible */}
-                    {showTimeline && msg.agentLogs && msg.agentLogs.length > 0 && !msg.isStreaming && (
-                      <div className="agent-reasoning-panel" style={{ marginTop: '12px' }}>
-                        <details>
-                          <summary style={{ cursor: 'pointer', fontSize: '0.8rem', color: 'var(--color-primary)', outline: 'none', fontWeight: 600 }}>
-                            🛠️ View Agent Execution Audit Traces ({msg.agentLogs.length} Agents)
-                          </summary>
-                          <div style={{ marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                            {msg.agentLogs.map(log => (
-                              <div key={log.agent_log_id} className="agent-log-step" style={{ background: 'rgba(0,0,0,0.25)', borderRadius: '8px', border: '1px solid var(--border-color)', padding: '10px 14px' }}>
-                                <div className="agent-log-header" style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '0.8rem' }}>
-                                  <span style={{ color: 'var(--color-primary)' }}>🤖 {log.agent_name}</span>
-                                  <span style={{ color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <span style={{ color: 'var(--color-success)', display: 'flex', alignItems: 'center', gap: '2px' }} title="Agent Confidence Score">
-                                      <Sparkles size={10} /> {Math.round(log.confidence_score * 100)}%
-                                    </span>
-                                    <span style={{ display: 'flex', alignItems: 'center', gap: '2px' }} title="Execution Latency">
-                                      <Clock size={10} /> {log.execution_time_ms}ms
-                                    </span>
-                                  </span>
-                                </div>
-                                <div style={{ color: 'var(--text-secondary)', marginTop: '4px', fontSize: '0.78rem' }}>
-                                  <strong>Task Description:</strong> {log.task_description}
-                                </div>
-                                <div style={{ color: 'var(--text-primary)', marginTop: '6px', fontSize: '0.78rem', background: 'rgba(255,255,255,0.02)', padding: '6px 10px', borderRadius: '4px', borderLeft: '3px solid var(--color-primary)' }}>
-                                  <strong>Result Payload:</strong> {log.output_data}
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </details>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-
-              {/* Dynamic Live Reasoning timeline for active processing request */}
-              {loading && simulatedLogs.length > 0 && (
-                <div className="chat-message agent" style={{ flexDirection: 'column', width: '100%', maxWidth: '100%' }}>
-                  <div style={{ display: 'flex', gap: '16px', width: '100%' }}>
-                    <div className="sidebar-avatar" style={{ border: '2px solid var(--color-warning)', color: 'var(--color-warning)' }}>...</div>
-                    <div className="message-bubble" style={{ background: 'var(--bg-secondary)', border: '1px solid var(--color-warning)', width: '100%' }}>
-                      <h5 style={{ color: 'var(--color-warning)', marginBottom: '12px', fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <Activity size={14} className="spinning-icon" /> Live Agent Graph Orchestration Traversal...
-                      </h5>
-                      
-                      {/* Interactive flowchart timeline */}
-                      <div className="live-timeline-flow" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                        {simulatedLogs.map((log, lIdx) => (
-                          <div 
-                            key={lIdx} 
-                            style={{ 
-                              display: 'flex', 
-                              alignItems: 'center', 
-                              gap: '12px', 
-                              opacity: activeStepIndex === lIdx ? 1 : 0.7,
-                              transform: activeStepIndex === lIdx ? 'scale(1.01)' : 'scale(1)',
-                              transition: 'all 0.3s ease',
-                              background: activeStepIndex === lIdx ? 'rgba(99,102,241,0.08)' : 'rgba(255,255,255,0.02)',
-                              border: activeStepIndex === lIdx ? '1px solid var(--color-primary)' : '1px solid var(--border-color)',
-                              padding: '10px 14px',
-                              borderRadius: '8px'
-                            }}
-                          >
-                            <div style={{
-                              width: '24px',
-                              height: '24px',
-                              borderRadius: '50%',
-                              background: activeStepIndex === lIdx ? 'var(--color-primary)' : 'var(--color-success)',
-                              color: 'white',
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                              fontSize: '0.75rem',
-                              fontWeight: 'bold'
-                            }}>
-                              {lIdx + 1}
-                            </div>
-                            <div style={{ flexGrow: 1 }}>
-                              <div style={{ display: 'flex', justifyContent: 'between', alignItems: 'center' }}>
-                                <strong style={{ fontSize: '0.85rem', color: activeStepIndex === lIdx ? 'var(--color-primary)' : 'var(--text-primary)' }}>
-                                  {log.agent_name}
-                                </strong>
-                                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                                  <Clock size={10} /> {log.execution_time_ms}ms
-                                </span>
-                              </div>
-                              <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
-                                {log.task_description}
-                              </div>
-                            </div>
-                            {activeStepIndex === lIdx && <ArrowRight size={16} style={{ color: 'var(--color-primary)' }} />}
-                          </div>
+                      <div className="ai-sources">
+                        <span className="ai-sources-label">Sources</span>
+                        {msg.sources.map((src, idx) => (
+                          <span key={idx} className="ai-source-chip" title={src.label}>{sourceIcon(src.type)} {src.label}</span>
                         ))}
                       </div>
-                    </div>
+                    )}
+
+                    {!msg.notice && (
+                      <div className="ai-answer-actions">
+                        <button className="ai-link-btn" onClick={() => copyAnswer(msg)}>
+                          {copiedId === msg.id ? <><Check size={13} /> Copied</> : <><Copy size={13} /> Copy</>}
+                        </button>
+                        {msg.steps && msg.steps.length > 0 && (
+                          <button className="ai-link-btn" onClick={() => setOpenSteps((prev) => ({ ...prev, [msg.id]: !prev[msg.id] }))}>
+                            {openSteps[msg.id] ? <ChevronDown size={13} /> : <ChevronRight size={13} />} How this was answered
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {msg.steps && openSteps[msg.id] && (
+                      <ol className="ai-steps">
+                        {msg.steps.map((step, idx) => (
+                          <li key={idx}>
+                            <div className="ai-step-name">{STEP_NAMES[step.agent] || step.agent}</div>
+                            <div className="ai-step-meta">
+                              {step.duration_ms !== null && step.duration_ms !== undefined ? `${step.duration_ms} ms` : ''}
+                            </div>
+                          </li>
+                        ))}
+                      </ol>
+                    )}
                   </div>
                 </div>
-              )}
+              )
+            ))}
 
-              {loading && simulatedLogs.length === 0 && (
-                <div className="chat-message agent">
-                  <div className="sidebar-avatar">...</div>
-                  <div className="message-bubble" style={{ fontStyle: 'italic', color: 'var(--text-muted)' }}>
-                    Planner Agent analyzing user prompt and calculating graph routing...
-                  </div>
+            {sending && (
+              <div className="ai-msg ai-msg-assistant">
+                <div className="ai-avatar"><Sparkles size={15} /></div>
+                <div className="ai-thinking" aria-live="polite">
+                  <span className="ai-dot" /><span className="ai-dot" /><span className="ai-dot" />
+                  <span className="ai-thinking-text">Looking through company data...</span>
                 </div>
-              )}
-              <div ref={chatEndRef} />
-            </div>
-
-            {/* Input area */}
-            <form onSubmit={handleSendMessage} className="chat-input-area" style={{ borderTop: '1px solid var(--border-color)' }}>
-              <input
-                className="input-field"
-                type="text"
-                placeholder="Ask about project statuses, employee charts, or company policies..."
-                value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                required
-                disabled={loading}
-              />
-              <button className="btn btn-primary" type="submit" disabled={loading} style={{ width: '48px', height: '48px', padding: 0 }}>
-                <Send size={16} />
-              </button>
-            </form>
-          </>
-        ) : (
-          <div style={{ display: 'flex', height: '100%', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '16px' }}>
-            <BrainCircuit size={64} style={{ color: 'var(--color-primary)', opacity: 0.4 }} />
-            <h4 style={{ fontSize: '1.2rem', color: 'var(--text-secondary)' }}>AI Orchestrator Playground</h4>
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', maxWidth: '350px', textAlign: 'center' }}>
-              Select a conversation thread in the session catalog or create a new thread to interact with the multi-agent operating system.
-            </p>
+              </div>
+            )}
+            <div ref={endRef} />
           </div>
-        )}
-      </div>
+        </div>
 
-      {/* 3. Popup details modal for source card details */}
-      {selectedSourceDetail && (
-        <div style={{
-          position: 'fixed',
-          top: 0,
-          left: 0,
-          right: 0,
-          bottom: 0,
-          background: 'rgba(0,0,0,0.7)',
-          backdropFilter: 'blur(4px)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          zIndex: 999
-        }}>
-          <div className="glass-card" style={{ width: '500px', maxWidth: '90%', padding: '28px' }}>
-            <h4 style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', borderBottom: '1px solid var(--border-color)', paddingBottom: '10px' }}>
-              <FileText size={18} style={{ color: 'var(--color-primary)' }} /> Source Details
-            </h4>
-            <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginBottom: '8px' }}>RETRIEVAL CITATION IDENTIFIER:</p>
-            <div style={{ background: 'var(--bg-tertiary)', padding: '12px', borderRadius: '8px', border: '1px solid var(--border-color)', fontFamily: 'monospace', fontSize: '0.8rem', color: 'var(--color-primary)', marginBottom: '16px', overflowWrap: 'break-word' }}>
-              {selectedSourceDetail}
-            </div>
-            <p style={{ fontSize: '0.88rem', color: 'var(--text-secondary)', lineHeight: 1.5, marginBottom: '20px' }}>
-              This record was retrieved as part of the RAG pipeline. It was pulled via Qdrant semantic matching or Neo4j node query, and re-ranked using Sentence Transformer similarity metrics.
-            </p>
-            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-              <button onClick={() => setSelectedSourceDetail(null)} className="btn btn-primary" style={{ padding: '8px 20px', fontSize: '0.85rem' }}>
-                Close Details
+        <form className="ai-composer" onSubmit={handleSubmit}>
+          <div className="ai-column">
+            <div className="ai-composer-box">
+              <textarea
+                ref={inputRef}
+                rows={1}
+                placeholder="Ask a question about the company..."
+                value={input}
+                maxLength={4000}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                disabled={sending}
+                aria-label="Your question"
+              />
+              <button type="submit" className="ai-send" disabled={sending || !input.trim()} title="Send" aria-label="Send">
+                <ArrowUp size={18} />
               </button>
+            </div>
+            <div className="ai-composer-hint">Enter to send, Shift + Enter for a new line. Answers are checked against company data, but verify anything important.</div>
+          </div>
+        </form>
+      </section>
+
+      {/* ---------------- Source search ---------------- */}
+      {searchOpen && (
+        <aside className="glass-card ai-search-panel">
+          <div className="ai-search-head">
+            <h3><Search size={16} /> Search sources</h3>
+            <button className="ai-icon-btn" onClick={() => setSearchOpen(false)} title="Close" aria-label="Close search"><X size={16} /></button>
+          </div>
+          <p className="ai-muted">
+            Find policies, documents, your emails, your meetings and past chats. What you can open depends on your role.
+          </p>
+          <form onSubmit={runSearch} className="ai-search-form">
+            <input
+              className="input-field"
+              type="text"
+              placeholder="e.g. remote work policy"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              aria-label="Search text"
+            />
+            <div className="ai-search-row">
+              <select className="input-field" value={searchScope} onChange={(e) => setSearchScope(e.target.value)} aria-label="Where to search">
+                <option value="all">Everything</option>
+                <option value="policies">Policies</option>
+                <option value="documents">Documents</option>
+                <option value="emails">My emails</option>
+                <option value="meetings">My meetings</option>
+                <option value="chats">My past chats</option>
+              </select>
+              <button className="btn btn-primary" type="submit" disabled={searching || searchQuery.trim().length < 2}>
+                {searching ? 'Searching...' : 'Search'}
+              </button>
+            </div>
+          </form>
+
+          {searchError && <div className="ai-inline-error">{searchError}</div>}
+
+          {searchResults !== null && !searchVector && (
+            <div className="ai-search-note">
+              Semantic search (Qdrant) is not running, so these are keyword matches from the policies and documents tables only.
+            </div>
+          )}
+
+          <div className="ai-search-results">
+            {searchResults !== null && searchResults.length === 0 && !searching && (
+              <p className="ai-muted">Nothing matched. Try different words.</p>
+            )}
+            {(searchResults || []).map((result, idx) => (
+              <div key={idx} className="ai-search-result">
+                <div className="ai-search-result-head">
+                  <span className="badge badge-success">{result.type}</span>
+                  <span className="ai-search-score" title={`Found in ${result.store}`}>{Math.round(result.score * 100)}% match</span>
+                </div>
+                <div className="ai-search-result-title">{result.title}</div>
+                {result.details.length > 0 && <div className="ai-search-result-meta">{result.details.join(' · ')}</div>}
+                <p className={result.restricted ? 'ai-search-restricted' : ''}>{result.text.length > 320 ? `${result.text.slice(0, 320)}...` : result.text}</p>
+                {!result.restricted && <button className="ai-link-btn" onClick={() => askAbout(result)}>Ask about this</button>}
+              </div>
+            ))}
+          </div>
+        </aside>
+      )}
+
+      {/* ---------------- Delete confirmation ---------------- */}
+      {deleteTarget && (
+        <div className="ai-modal-backdrop" onClick={() => !deleting && setDeleteTarget(null)}>
+          <div className="glass-card ai-modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+            <h3>Delete this chat?</h3>
+            <p>
+              "{deleteTarget.session_title}" and all of its messages will be permanently deleted. This can't be undone.
+            </p>
+            <div className="ai-modal-actions">
+              <button className="btn btn-secondary" onClick={() => setDeleteTarget(null)} disabled={deleting}>Cancel</button>
+              <button className="btn ai-btn-danger" onClick={confirmDelete} disabled={deleting}>{deleting ? 'Deleting...' : 'Delete chat'}</button>
             </div>
           </div>
         </div>

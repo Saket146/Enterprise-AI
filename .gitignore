@@ -46,3 +46,4 @@ build/
 # IDE
 
 .idea/
+/backend/.venv/

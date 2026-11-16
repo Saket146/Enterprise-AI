@@ -7,7 +7,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.configuration.config import settings
-from app.database.connection import SessionLocal, engine
+from app.database.connection import SessionLocal, engine, check_dependencies
+from app.security.permissions import ROLE_PERMISSIONS
 from app.models.models import Role, Employee
 from app.authentication.security import get_password_hash
 from app.observability import metrics
@@ -69,8 +70,52 @@ def startup_db_setup():
         db.commit()
         logger.info("Database schema verification completed (hashed_password column is present).")
 
-        # 2. Seed Default Roles if missing
-        required_roles = ["Admin", "HR Manager", "Project Manager", "Employee", "AI Administrator"]
+        # 1b. Synchronize PostgreSQL primary key sequences with existing data.
+        # This must run BEFORE anything is inserted below: data imported with explicit ids
+        # (CSV / SQL seed) leaves the sequences at 1, and the next INSERT would collide
+        # with an existing primary key and abort the whole startup routine.
+        tables_with_pks = [
+            ("departments", "department_id"),
+            ("roles", "role_id"),
+            ("employees", "employee_id"),
+            ("clients", "client_id"),
+            ("contracts", "contract_id"),
+            ("projects", "project_id"),
+            ("project_members", "project_member_id"),
+            ("tasks", "task_id"),
+            ("milestones", "milestone_id"),
+            ("documents", "document_id"),
+            ("meetings", "meeting_id"),
+            ("emails", "email_id"),
+            ("policies", "policy_id"),
+            ("attendance", "attendance_id"),
+            ("leave_requests", "leave_id"),
+            ("payroll", "payroll_id"),
+            ("performance_reviews", "review_id"),
+            ("vendors", "vendor_id"),
+            ("budgets", "budget_id"),
+            ("expenses", "expense_id"),
+            ("invoices", "invoice_id"),
+            ("chat_sessions", "session_id"),
+            ("workflow_runs", "workflow_id"),
+            ("agent_logs", "agent_log_id"),
+            ("audit_logs", "audit_id"),
+            ("approvals", "approval_id"),
+            ("evaluation_runs", "evaluation_id"),
+        ]
+        for tbl, pk in tables_with_pks:
+            try:
+                # Savepoint: a missing table must not poison the surrounding transaction
+                with db.begin_nested():
+                    db.execute(text(f"SELECT setval(pg_get_serial_sequence('{tbl}', '{pk}'), COALESCE((SELECT MAX({pk}) FROM {tbl}), 1));"))
+            except Exception as seq_err:
+                logger.debug(f"Sequence sync skipped for {tbl}: {seq_err}")
+        db.commit()
+
+        # 2. Seed the system (non-job) roles if missing.  Job roles such as CEO,
+        # HR Director or Backend Engineer come from the company data in the roles
+        # table; what each one may do is defined in app/security/permissions.py.
+        required_roles = ["Admin", "AI Administrator", "Employee"]
         for r_name in required_roles:
             exists = db.query(Role).filter(Role.role_name == r_name).first()
             if not exists:
@@ -83,6 +128,18 @@ def startup_db_setup():
                 db.add(new_role)
         db.commit()
 
+        # 2b. Report job roles that have no entry in the permission matrix
+        # (they still work, but only with base access).
+        unmapped = [
+            r.role_name for r in db.query(Role).all()
+            if (r.role_name or "").strip().lower() not in ROLE_PERMISSIONS
+        ]
+        if unmapped:
+            logger.warning(
+                f"RBAC: roles without an entry in ROLE_PERMISSIONS (base access only): {unmapped}. "
+                "Add them to app/security/permissions.py to grant more."
+            )
+
         # 3. Handle passwords for imported/seeded employees
         # Check if there are employees with null passwords, and set a default 'password123'
         unsecured_employees = db.query(Employee).filter(
@@ -92,22 +149,20 @@ def startup_db_setup():
         if unsecured_employees:
             logger.info(f"Found {len(unsecured_employees)} employees without passwords. Seeding default 'password123' password...")
             default_hashed = get_password_hash("password123")
+            emp_role = db.query(Role).filter(Role.role_name == "Employee").first()
+            emp_role_id = emp_role.role_id if emp_role else None
             for emp in unsecured_employees:
                 emp.hashed_password = default_hashed
-                
-                # Make sure employees have a default role if role_id is null
-                if not emp.role_id:
-                    # Assign standard 'Employee' role
-                    emp_role = db.query(Role).filter(Role.role_name == "Employee").first()
-                    if emp_role:
-                        emp.role_id = emp_role.role_id
-                        
+                if not emp.role_id and emp_role_id:
+                    emp.role_id = emp_role_id
             db.commit()
             logger.info("Successfully updated password hashes for all employees.")
 
-        # 4. Ensure at least one Admin user exists
+        # 5. Ensure at least one Admin user exists
         admin_role = db.query(Role).filter(Role.role_name == "Admin").first()
-        admin_user = db.query(Employee).filter(Employee.role_id == admin_role.role_id).first() if admin_role else None
+        admin_user = db.query(Employee).filter(
+            (Employee.role_id == admin_role.role_id) | (Employee.email == "admin@enterprise.com")
+        ).first() if admin_role else None
         if not admin_user and admin_role:
             logger.info("Creating default system admin account...")
             default_admin = Employee(
@@ -121,7 +176,21 @@ def startup_db_setup():
             )
             db.add(default_admin)
             db.commit()
-            logger.info("Admin account 'admin@enterprise.com' created (Password: 'adminpass').")
+            logger.warning("Admin account 'admin@enterprise.com' created with the default password - change it.")
+
+        # 6. Report which of the four data stores are reachable
+        for name, info in check_dependencies().items():
+            if info["status"] == "online":
+                logger.info(f"Data store '{name}': online")
+            elif info["required"] == "true":
+                logger.error(f"Data store '{name}': OFFLINE (required) - {info.get('error')}")
+            else:
+                logger.warning(
+                    f"Data store '{name}': offline (optional) - the API keeps working without it. {info.get('error', '')}"
+                )
+
+        if settings.JWT_SECRET_KEY == "enterprise_ai_os_secret_key_very_secure_change_me_in_prod":
+            logger.warning("JWT_SECRET_KEY is still the built-in default. Set a private value in backend/.env.")
             
     except Exception as e:
         db.rollback()
@@ -155,6 +224,17 @@ app.include_router(evaluations_router)
 @app.get("/health")
 def health():
     return {"status": "healthy", "version": settings.PROJECT_VERSION}
+
+@app.get("/health/dependencies")
+def health_dependencies():
+    """Connectivity of PostgreSQL (required) and Redis, Qdrant, Neo4j (optional)."""
+    report = check_dependencies()
+    required_ok = all(v["status"] == "online" for v in report.values() if v["required"] == "true")
+    all_ok = all(v["status"] == "online" for v in report.values())
+    return {
+        "status": "healthy" if all_ok else ("degraded" if required_ok else "unhealthy"),
+        "dependencies": {name: {k: v for k, v in info.items() if k != "error"} for name, info in report.items()},
+    }
 
 @app.get("/")
 def read_root():
