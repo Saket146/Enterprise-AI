@@ -1,8 +1,11 @@
+import os
+from pathlib import Path
+from typing import Optional
 import logging
 import time
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -189,6 +192,15 @@ def startup_db_setup():
                     f"Data store '{name}': offline (optional) - the API keeps working without it. {info.get('error', '')}"
                 )
 
+        # 7. Language model, and secrets put in the template file by mistake
+        from app.services.llm_service import llm_service
+        llm = llm_service.status()
+        if llm["provider"] == "mock":
+            logger.warning("Language model: none configured - answers use the built-in writer. Set LLM_PROVIDER and the API key in backend/.env.")
+        else:
+            logger.info(f"Language model: {llm['provider']} ({llm['model']}). Use the Operations Center 'Test connection' button to check it.")
+        _warn_about_secrets_in_template()
+
         if settings.JWT_SECRET_KEY == "enterprise_ai_os_secret_key_very_secure_change_me_in_prod":
             logger.warning("JWT_SECRET_KEY is still the built-in default. Set a private value in backend/.env.")
             
@@ -225,22 +237,82 @@ app.include_router(evaluations_router)
 def health():
     return {"status": "healthy", "version": settings.PROJECT_VERSION}
 
+def _warn_about_secrets_in_template():
+    """backend/.env.example is committed to git and is NOT read by the backend; real secrets belong in backend/.env."""
+    template = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.example")
+    if not os.path.exists(template):
+        return
+    try:
+        with open(template, encoding="utf-8-sig") as handle:
+            lines = handle.read().splitlines()
+    except Exception:
+        return
+    placeholders = ("", "replace-with-a-64-character-random-secret", "your-key", "your_api_key", "changeme")
+    for line in lines:
+        if "=" not in line or line.strip().startswith("#"):
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key in ("GEMINI_API_KEY", "OPENAI_API_KEY", "JWT_SECRET_KEY") and value.lower() not in placeholders:
+            logger.warning(
+                f"backend/.env.example contains a value for {key}. That file is a template that is committed to git, "
+                f"and the backend does not read it. Move the value to backend/.env and empty it in .env.example."
+            )
+
+
 @app.get("/health/dependencies")
 def health_dependencies():
     """Connectivity of PostgreSQL (required) and Redis, Qdrant, Neo4j (optional)."""
     report = check_dependencies()
     required_ok = all(v["status"] == "online" for v in report.values() if v["required"] == "true")
     all_ok = all(v["status"] == "online" for v in report.values())
+    from app.services.llm_service import llm_service
+    llm = llm_service.status()
     return {
         "status": "healthy" if all_ok else ("degraded" if required_ok else "unhealthy"),
         "dependencies": {name: {k: v for k, v in info.items() if k != "error"} for name, info in report.items()},
+        # Last known state only (no call is made here): working | failing | untested | not_configured
+        "language_model": {"provider": llm["provider"], "model": llm["model"], "state": llm["state"],
+                           "avg_call_seconds": llm["avg_call_seconds"]},
     }
 
-@app.get("/")
-def read_root():
-    return {
-        "status": "online",
-        "service": settings.PROJECT_NAME,
-        "api_version": settings.PROJECT_VERSION,
-        "docs_url": "/docs"
-    }
+def _frontend_dist() -> Optional[Path]:
+    """Folder with the built website (npm run build), or None when it has not been built."""
+    candidates = [Path(settings.FRONTEND_DIST)] if settings.FRONTEND_DIST else []
+    root = Path(__file__).resolve().parent.parent
+    candidates += [root / "frontend" / "frontend" / "dist", root / "frontend" / "dist"]
+    for folder in candidates:
+        if (folder / "index.html").is_file():
+            return folder.resolve()
+    return None
+
+
+FRONTEND_DIST = _frontend_dist()
+API_PATHS = ("api/", "health", "docs", "redoc", "openapi.json")
+
+if FRONTEND_DIST:
+    # Production: the backend also serves the website, so the whole app runs on one address
+    logger.warning(f"Serving the website from {FRONTEND_DIST}")
+
+    @app.get("/", include_in_schema=False)
+    def read_root():
+        return FileResponse(FRONTEND_DIST / "index.html")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def website(path: str):
+        if path.startswith(API_PATHS):
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        file = (FRONTEND_DIST / path).resolve()
+        if file.is_file() and file.is_relative_to(FRONTEND_DIST):
+            return FileResponse(file)
+        # Page addresses such as /login belong to the single-page app
+        return FileResponse(FRONTEND_DIST / "index.html")
+else:
+    @app.get("/")
+    def read_root():
+        return {
+            "status": "online",
+            "service": settings.PROJECT_NAME,
+            "api_version": settings.PROJECT_VERSION,
+            "docs_url": "/docs",
+            "website": "not built here: run the Vite dev server, or `npm run build` to let the backend serve it",
+        }

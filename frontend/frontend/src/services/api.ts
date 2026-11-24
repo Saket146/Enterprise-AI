@@ -1,4 +1,7 @@
-const BASE_URL = 'http://localhost:8000';
+// Same address as the website: in development Vite forwards /api and /health to the backend
+// (see vite.config.ts); in production the backend serves this website itself.
+// Set VITE_API_URL only if the backend runs on a different address.
+const BASE_URL: string = (import.meta as any).env?.VITE_API_URL || '';
 
 // Retrieve authorization token from localStorage
 const getAuthHeaders = (): Record<string, string> => {
@@ -214,7 +217,11 @@ export const api = {
     decide: (approvalId: number, approved: boolean, note: string) => request(`/api/workflows/approvals/${approvalId}`, { method: 'POST', body: JSON.stringify({ approved, note }) }),
   },
   analytics: { overview: () => request('/api/analytics/overview') },
-  monitoring: { dashboard: () => request('/api/monitoring/dashboard') },
+  monitoring: {
+    dashboard: () => request('/api/monitoring/dashboard'),
+    llm: () => request('/api/monitoring/llm'),
+    testLlm: () => request('/api/monitoring/llm/test', { method: 'POST' }),
+  },
   evaluations: {
     run: () => request('/api/evaluations/run', { method: 'POST' }),
     history: () => request('/api/evaluations/history'),

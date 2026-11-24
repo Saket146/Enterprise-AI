@@ -1,5 +1,6 @@
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, Body, Depends, HTTPException, status, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func
@@ -20,6 +21,9 @@ from app.services.answer_composer import build_sources
 from app.services.chat_titles import DEFAULT_TITLE, clean_title, generate_title, is_default_title
 
 logger = logging.getLogger(__name__)
+
+# Background workers for writing chat titles while the answer is being prepared
+_title_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="chat-title")
 
 router = APIRouter(prefix="/api/communications", tags=["Communication & AI Sessions"])
 
@@ -281,6 +285,12 @@ def send_chat_message(
             detail=error_msg
         )
 
+    # The title of a new chat is written at the same time as the answer, not after it
+    title_future = None
+    if is_default_title(session.session_title) and not session.message_count \
+            and db.query(ChatMessage.message_id).filter(ChatMessage.session_id == session_id).first() is None:
+        title_future = _title_pool.submit(generate_title, message)
+
     # 2. Retrieve history and construct initial state
     history = short_term_memory.get_history(session_id)
     
@@ -362,7 +372,11 @@ def send_chat_message(
     # 8. Name the chat from its first question (a title the user chose is never overwritten)
     title_changed = False
     if is_first_message and is_default_title(session.session_title):
-        session.session_title = generate_title(message)
+        try:
+            session.session_title = title_future.result(timeout=30) if title_future else generate_title(message)
+        except Exception as e:
+            logger.warning(f"Chat title generation failed, using a title from the question: {e}")
+            session.session_title = clean_title(message) or DEFAULT_TITLE
         title_changed = True
     session.message_count = (session.message_count or 0) + 2
 

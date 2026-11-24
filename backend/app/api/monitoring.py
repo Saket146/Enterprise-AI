@@ -35,3 +35,23 @@ def dashboard(user=Depends(require(Perm.SYSTEM_MONITOR)), db: Session = Depends(
         for e in db.query(AuditLog).filter(AuditLog.action_type.in_(["blocked_prompt", "rbac_denied"])).order_by(AuditLog.audit_id.desc()).limit(8)
     ]
     return data
+
+
+
+@router.get("/llm")
+def language_model_status(user=Depends(require(Perm.SYSTEM_MONITOR))):
+    """Which language model answers, and whether its last calls worked (the API key is never returned)."""
+    from app.services.llm_service import llm_service
+    return llm_service.status()
+
+
+@router.post("/llm/test")
+def test_language_model(user=Depends(require(Perm.SYSTEM_MONITOR))):
+    """Send one tiny request to the language model to check that the key and the model work."""
+    from app.services.llm_service import llm_service
+    if not llm_service.has_model:
+        return {**llm_service.status(), "ok": False, "reply": None,
+                "message": "No language model is configured. Set LLM_PROVIDER and the API key in backend/.env, then restart the backend."}
+    result = llm_service.test_connection()
+    result["message"] = "The language model answered." if result["ok"] else (result.get("last_error") or "The language model did not answer.")
+    return result

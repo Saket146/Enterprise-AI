@@ -49,6 +49,9 @@ export const OperationsCenter: React.FC = () => {
 
   // System status
   const [stores, setStores] = useState<Record<string, { status: string }> | null>(null);
+  const [llm, setLlm] = useState<{ provider: string; model: string | null; state: string; last_error?: string | null; avg_call_seconds?: number | null } | null>(null);
+  const [llmTesting, setLlmTesting] = useState(false);
+  const [llmNotice, setLlmNotice] = useState<Notice | null>(null);
   const [storesError, setStoresError] = useState('');
 
   // Requests
@@ -93,6 +96,7 @@ export const OperationsCenter: React.FC = () => {
     try {
       const res = await api.system.dependencies();
       setStores(res.dependencies || {});
+      setLlm(res.language_model || null);
       setStoresError('');
     } catch (err: any) {
       setStoresError(err?.message || 'Could not check the data stores.');
@@ -234,6 +238,27 @@ export const OperationsCenter: React.FC = () => {
 
   const storeOnline = (key: string) => stores?.[key]?.status === 'online';
 
+  const testLanguageModel = async () => {
+    setLlmTesting(true);
+    setLlmNotice(null);
+    try {
+      const res = await api.monitoring.testLlm();
+      setLlm({ provider: res.provider, model: res.model, state: res.state, last_error: res.last_error, avg_call_seconds: res.avg_call_seconds });
+      setLlmNotice({ kind: res.ok ? 'ok' : 'error', text: res.ok ? `${res.model} answered. The assistant is using it.` : res.message });
+    } catch (err: any) {
+      setLlmNotice({ kind: 'error', text: err?.message || 'The test could not be run.' });
+    } finally {
+      setLlmTesting(false);
+    }
+  };
+
+  const LLM_STATES: Record<string, { label: string; cls: string }> = {
+    working: { label: 'Working', cls: 'ok' },
+    failing: { label: 'Failing', cls: 'bad' },
+    untested: { label: 'Not used yet', cls: '' },
+    not_configured: { label: 'Not configured', cls: 'bad' },
+  };
+
   return (
     <div className="animated-fade-in oc">
       <p className="oc-intro">
@@ -247,7 +272,7 @@ export const OperationsCenter: React.FC = () => {
           <h3><ServerCog size={18} /> System status</h3>
           <button className="btn btn-secondary oc-small-btn" onClick={loadStores}><RefreshCw size={14} /> Refresh</button>
         </div>
-        <p className="oc-help">The four data stores behind the application. Only PostgreSQL is required; the assistant keeps answering from the database when the others are offline.</p>
+        <p className="oc-help">The four data stores and the language model behind the application. Only PostgreSQL is required; the assistant keeps answering from the database when the others are offline.</p>
         {storesError && <div className="oc-notice error">{storesError}</div>}
         <div className="oc-stores">
           {STORES.map((store) => {
@@ -263,7 +288,26 @@ export const OperationsCenter: React.FC = () => {
               </div>
             );
           })}
+          {llm && (
+            <div className={`oc-store ${llm.state === 'working' ? 'online' : llm.state === 'untested' ? '' : 'offline'}`}>
+              <div className="oc-store-top">
+                <span className="oc-store-name"><ServerCog size={14} /> Language model</span>
+                <span className={`oc-pill ${LLM_STATES[llm.state]?.cls || ''}`}>{LLM_STATES[llm.state]?.label || llm.state}</span>
+              </div>
+              <div className="oc-store-purpose">
+                {llm.provider === 'mock'
+                  ? 'None configured: answers use the built-in writer.'
+                  : `${llm.provider === 'gemini' ? 'Gemini' : 'OpenAI'} · ${llm.model === 'auto' ? 'newest stable Flash' : llm.model}${llm.avg_call_seconds ? ` · about ${llm.avg_call_seconds} s per call` : ''}`}
+              </div>
+              {canMonitor && llm.provider !== 'mock' && (
+                <button className="oc-link" style={{ marginTop: 6, padding: 0 }} onClick={testLanguageModel} disabled={llmTesting}>
+                  {llmTesting ? 'Testing...' : 'Test connection'}
+                </button>
+              )}
+            </div>
+          )}
         </div>
+        {llmNotice && <div className={`oc-notice ${llmNotice.kind}`}>{llmNotice.text}</div>}
       </section>
 
       {/* ---------------- Approvals ---------------- */}

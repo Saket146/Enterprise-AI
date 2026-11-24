@@ -52,6 +52,13 @@ STOPWORDS = {
 # Role names that are also ordinary words; never treated as a job-title filter.
 GENERIC_ROLE_NAMES = {"employee", "staff", "user"}
 
+# Words too common in policy texts to identify a policy by themselves
+POLICY_GENERIC_TERMS = {
+    "number", "version", "polic", "policy", "document", "department", "employee", "company", "rule", "rules",
+    "want", "need", "work", "team", "time", "year", "day", "days", "people", "person", "use", "used", "make",
+    "review", "reviewed", "approval", "approved", "manager", "head", "write", "written", "change", "changes",
+}
+
 OPEN_TASK_EXCLUDE = {"completed", "done", "closed", "cancelled", "canceled"}
 
 
@@ -527,17 +534,25 @@ class PostgresRetriever:
         access = policy_access(user_context)
         can_read = access == "content"
         q = (query or "").lower()
+        # Words that appear in nearly every policy ("version number", "department") say nothing about the topic
+        topic_terms = [t for t in terms if t not in POLICY_GENERIC_TERMS]
+        # One matching word in the text is enough only when the question is clearly about rules
+        policy_question = bool(re.search(r"\bpolic|\brules?\b|\ballowed\b|\bguideline|\bhandbook|\bprocedure|\bcan i\b|\bmay i\b|\bam i\b", q))
+        needed_text_hits = 1 if policy_question else 2
         scored: List[Tuple[float, Policy]] = []
         for p in db.query(Policy).all():
             name = (p.policy_name or "").lower()
             name_words = {_stem(w) for w in re.findall(r"[a-z0-9]+", name)}
-            score = 3.0 * sum(1 for t in terms if t in name_words)
+            name_hits = sum(1 for t in terms if t in name_words)
+            text_hits = 0
             if can_read:
-                # Only readers may find a policy through words inside its text
-                desc = (p.description or "").lower()
-                score += 1.0 * sum(1 for t in terms if t in desc)
-            if score <= 0:
+                # Only readers may find a policy through words inside its text; whole words only,
+                # so "his" does not match "this" and "number" does not match every "version number"
+                text_words = {_stem(w) for w in re.findall(r"[a-z0-9]+", (p.description or "").lower())}
+                text_hits = sum(1 for t in topic_terms if t in text_words)
+            if name_hits == 0 and text_hits < needed_text_hits:
                 continue
+            score = 3.0 * name_hits + 1.0 * text_hits
             if name and re.sub(r"\s+polic(?:y|ies)$", "", name) in q:
                 score += 10
             if p.department_id and p.department_id == user_context.get("department_id"):

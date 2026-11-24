@@ -47,3 +47,6 @@ build/
 
 .idea/
 /backend/.venv/
+
+# Database backups (contain company data)
+*.dump

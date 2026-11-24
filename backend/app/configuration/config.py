@@ -34,12 +34,18 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     LLM_PROVIDER: str = "mock"  # Options: 'gemini', 'openai', 'mock'
+    # Gemini model to use, e.g. gemini-2.5-flash. Leave empty to use the newest stable Flash model.
+    GEMINI_MODEL: str = ""
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
+    OPENAI_MODEL: str = "gpt-4o-mini"
 
     # JWT Settings
     JWT_SECRET_KEY: str = "enterprise_ai_os_secret_key_very_secure_change_me_in_prod"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours
     CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+    # Folder of the built website (frontend `npm run build`). Empty: found automatically.
+    FRONTEND_DIST: str = ""
     API_KEY_HEADER: str = "X-Enterprise-API-Key"
     ENTERPRISE_API_KEY: str = ""
     MAX_REQUEST_BYTES: int = 1_048_576

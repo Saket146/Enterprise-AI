@@ -66,7 +66,7 @@ class ControlledTools:
         logger.info(f"Tool execution: search_hr_policy on query: '{query}'")
 
         # Access (full text / titles only / nothing) is decided by the user's role inside both retrievers
-        hits = rag_service.search_collection(query, collection_name="policies", limit=3, user_context=user_context)
+        hits = rag_service.search_collection(query, collection_name="policies", limit=3, user_context=user_context, include_graph=False)
         hits += postgres_retriever.search(query, user_context, domains=("policies",), limit=3)
         return {
             "success": True,

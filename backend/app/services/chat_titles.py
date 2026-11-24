@@ -13,6 +13,8 @@ _LEADING_FILLER = re.compile(
     r"what is|what's|what are|who is|who's|who are|list|explain|describe)\b[\s,:-]*",
     re.IGNORECASE,
 )
+# Job titles and terms that read wrongly when only the first letter is capitalised ("Ceo")
+_ACRONYMS = {"ceo", "cto", "cfo", "hr", "it", "qa", "ai", "ml", "api", "vpn", "crm", "sql", "id", "kpi", "erp"}
 _SMALL_WORDS = {"a", "an", "and", "are", "as", "at", "by", "do", "for", "in", "is", "of", "on", "or", "the", "to", "we", "with", "per"}
 
 
@@ -45,7 +47,9 @@ def _heuristic_title(message: str) -> str:
         words.pop()                                   # do not end on a dangling connector
     titled = []
     for idx, word in enumerate(words):
-        if word.isupper() or any(ch.isdigit() for ch in word) or (word[:1].isupper() and idx > 0):
+        if word.lower() in _ACRONYMS:
+            titled.append(word.upper())
+        elif word.isupper() or any(ch.isdigit() for ch in word) or (word[:1].isupper() and idx > 0):
             titled.append(word)                       # acronyms, codes and names stay as typed
         elif idx > 0 and word.lower() in _SMALL_WORDS:
             titled.append(word.lower())
@@ -61,7 +65,7 @@ def generate_title(message: str) -> str:
             "Write a short title (3 to 6 words, no quotes, no trailing punctuation) for a conversation "
             f"that starts with this question:\n\n{(message or '')[:500]}\n\nTitle:"
         )
-        suggestion = llm_service.generate(prompt, max_tokens=20, strict=True)
+        suggestion = llm_service.generate(prompt, max_tokens=20, strict=True, thinking="minimal")
         if suggestion:
             title = clean_title(suggestion.splitlines()[0])
             if 2 <= len(title) <= MAX_TITLE_CHARS + 3:

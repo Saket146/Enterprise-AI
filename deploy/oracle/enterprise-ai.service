@@ -1,0 +1,16 @@
+[Unit]
+Description=Enterprise AI OS backend (FastAPI, also serves the website)
+After=network.target postgresql.service redis-server.service qdrant.service neo4j.service
+Wants=postgresql.service redis-server.service qdrant.service neo4j.service
+
+[Service]
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__/backend
+# One worker: the language-model status and the Redis fallback memory live in this process
+ExecStart=__APP_DIR__/backend/.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

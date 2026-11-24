@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 
 COLLECTIONS = ["documents", "policies", "emails", "meetings", "chats"]
 
-# How long an unreachable store is skipped before it is tried again.
-OFFLINE_RETRY_SECONDS = 30
+# How long an unreachable store is skipped before it is tried again. A refused connection to
+# localhost can take about 2 seconds on Windows, so retrying often would slow answers down.
+OFFLINE_RETRY_SECONDS = 300
 
 def cosine_similarity(v1: List[float], v2: List[float]) -> float:
     """Calculate the cosine similarity between two vector lists."""

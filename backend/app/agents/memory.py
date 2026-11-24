@@ -15,7 +15,7 @@ class RedisShortTermMemory:
     Manages short-term conversation logs inside Redis to support quick agent memory retrieval.
     Includes in-memory local dict fallbacks to prevent crashes if Redis is offline.
     """
-    RETRY_SECONDS = 30
+    RETRY_SECONDS = 300   # a refused connection can take ~2 s on Windows; do not retry on every message
     MAX_MESSAGES = 40  # keep the most recent turns only
 
     def __init__(self):

@@ -18,6 +18,12 @@ class AgentState(TypedDict):
     # Accumulate data chunks retrieved from Postgres, Qdrant and Neo4j
     retrieved_context: Annotated[List[Dict[str, Any]], add]
     
+    # The latest message rewritten so it stands on its own (follow-ups resolved by the planner)
+    search_query: str
+
+    # Who wrote the answer: "language model" or "composer" (the built-in writer)
+    answer_writer: str
+
     # Temporary workspace for report generation or feedback loops
     report_content: str
     critic_feedback: str
